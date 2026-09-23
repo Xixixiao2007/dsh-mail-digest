@@ -248,7 +248,11 @@ node test-mime.mjs    # MIME 解析 / 中文编码 / 引用剥离 / 候选排序
 node test-smtp.mjs    # 假 SMTP 服务器对发：认证 / 中文主题 / 正文还原 / 安全底线
 ```
 
-合计 328 项。
+合计 328 项。另外安装脚本的用户全局指令区块有单独测试（用临时目录，不碰真实文件）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File test-installer.ps1
+```
 
 ## 开发
 
