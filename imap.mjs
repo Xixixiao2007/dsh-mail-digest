@@ -767,8 +767,9 @@ export async function fetchRecent(options) {
  * 认不出来 / 没采纳的邮件**绝不标记**，留着让用户能看见、能重试。
  *
  * @param {object} options - 连接参数（同 fetchReplies），另有：
- * @param {Array<{mailbox: string, uid: string}>} options.messages - 要标记的邮件。
- * @returns {Promise<{marked: number}>} 实际标记成功的数量。
+ * @param {Array<{mailbox: string, uid: string}>} [options.messages] - 要标记的邮件。
+ * @param {boolean} [options.unseen=false] - true 表示**移除** `\Seen`（改回未读，供诊断用）。
+ * @returns {Promise<{marked: number}>} 实际处理成功的数量。
  */
 export async function markSeen(options) {
   const {
@@ -779,9 +780,15 @@ export async function markSeen(options) {
     user,
     pass,
     messages,
+    unseen = false,
     timeoutMs = 20_000,
   } = options ?? {}
-  const list = Array.isArray(messages) ? messages.filter((m) => m && m.uid && m.mailbox) : []
+  // 也接受 { mailbox, uids: [...] } 这种直接形式（便于诊断脚本）。
+  const direct = options?.mailbox && Array.isArray(options?.uids)
+    ? options.uids.map((uid) => ({ mailbox: options.mailbox, uid }))
+    : []
+  const list = [...(Array.isArray(messages) ? messages : []), ...direct]
+    .filter((m) => m && m.uid && m.mailbox)
   if (!host || !user || !pass || list.length === 0) return { marked: 0 }
 
   // 按文件夹分组：同一个文件夹里的 UID 可以一条 STORE 搞定。
@@ -813,7 +820,8 @@ export async function markSeen(options) {
       const selected = await connection.run(`SELECT ${quoteString(mailbox)}`)
       if (!selected.ok) continue
       const set = [...uids].join(',')
-      const stored = await connection.run(`UID STORE ${set} +FLAGS.SILENT (\\Seen)`)
+      const verb = unseen ? '-FLAGS.SILENT' : '+FLAGS.SILENT'
+      const stored = await connection.run(`UID STORE ${set} ${verb} (\\Seen)`)
       if (stored.ok) marked += uids.size
     }
     await connection.bye()
