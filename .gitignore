@@ -6,6 +6,9 @@ pnpm-lock.yaml
 config.json
 *.local.json
 
+# 运行时生成的待批准权限清单（含本机路径，且随运行变化，不进仓库）
+pending-permissions.json
+
 # 临时文件
 *.tmp
 *.log

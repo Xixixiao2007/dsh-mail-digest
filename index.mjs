@@ -528,30 +528,51 @@ export function apply(ctx) {
           accepted: { type: 'boolean', required: true },
           turn: { type: 'integer' },
           pendingCount: { type: 'integer' },
+          pendingSaved: { type: 'boolean' },
+          pendingPath: { type: 'string' },
+          pendingError: { type: 'string' },
         },
         additionalProperties: false,
       },
       render: (_args, value) => [{
         type: 'text',
-        text: value?.accepted
-          ? `已把这条摘要排进第 ${value.turn} 轮的邮件。`
-            + (typeof value.pendingCount === 'number'
-              ? `待批准权限清单现有 ${value.pendingCount} 项。`
-              : '')
-          : '这一轮已经发过信了，摘要没有采用。',
+        text: [
+          value?.accepted
+            ? `已把这条摘要排进第 ${value.turn} 轮的邮件。`
+            : '这一轮已经发过信了，摘要没有采用。',
+          typeof value?.pendingCount === 'number' ? `待批准权限清单：${value.pendingCount} 项。` : '',
+          value?.pendingSaved === false
+            ? `⚠ 清单写入失败：${value.pendingError || '未知原因'}（路径 ${value.pendingPath || '?'}）`
+            : '',
+          value?.pendingSaved === true && value?.pendingPath ? `清单已写入：${value.pendingPath}` : '',
+        ].filter(Boolean).join('\n'),
       }],
     },
     execute: (args, exec) => {
       const session = exec.agent?.session
       // 待批准清单与摘要相互独立：即使这一轮不采用摘要，也要能把清单记下来。
       let pendingCount = loadPending().length
+      let pendingSaved
+      let pendingPathUsed
+      let pendingError
       if (Array.isArray(args.pendingPermissions)) {
         const saved = savePending(args.pendingPermissions)
         pendingCount = saved.count
-        if (saved.ok) log('info', `待批准权限清单更新为 ${saved.count} 项（${saved.path}）`)
-        else log('warn', `待批准权限清单写入失败：${saved.error}`)
+        pendingSaved = saved.ok === true
+        pendingPathUsed = saved.path
+        pendingError = saved.error
+        if (saved.ok) log('info', `待批准权限清单更新为 ${saved.count} 项（${saved.path}${saved.fallback ? '，回退位置' : ''}）`)
+        else log('warn', `待批准权限清单写入失败（${saved.path}）：${saved.error}`)
       }
-      if (!session) return { accepted: false, turn: 0, pendingCount }
+      const base = {
+        accepted: false,
+        turn: 0,
+        pendingCount,
+        ...(pendingSaved === undefined ? {} : { pendingSaved }),
+        ...(pendingPathUsed ? { pendingPath: pendingPathUsed } : {}),
+        ...(pendingError ? { pendingError } : {}),
+      }
+      if (!session) return base
       // 找这一会话里最后一轮还没发信的状态。先快照：迭代期间别的路径会改动这个 Map。
       let target = null
       for (const [key, state] of [...turns.entries()]) {
@@ -559,10 +580,10 @@ export function apply(ctx) {
         if (state.ended) continue
         if (!target || state.turn > target.turn) target = state
       }
-      if (!target) return { accepted: false, turn: 0, pendingCount }
+      if (!target) return base
       target.explicit = String(args.summary ?? '')
       log('info', `已收到第 ${target.turn} 轮的自写摘要`)
-      return { accepted: true, turn: target.turn, pendingCount }
+      return { ...base, accepted: true, turn: target.turn }
     },
   })), 'dsh-mail-digest: mail_digest tool')
 

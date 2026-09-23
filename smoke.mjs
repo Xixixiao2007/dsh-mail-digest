@@ -23,7 +23,7 @@ const { defineTool } = await import('@deepseek-ai/dsh-tools')
 const plugin = await import('./index.mjs')
 const { cleanAnswerText, extractiveDigest, normalizeDigest, blocksToText } = await import('./digest.mjs')
 const { loadConfig, saveConfig, describeReadiness, publicConfig, configPath, providerChoices } = await import('./config.mjs')
-const { loadPending, renderPendingBlock, savePending, pendingPath } = await import('./pending.mjs')
+const { loadPending, renderPendingBlock, savePending, pendingPath, pendingFallbackPath, activePendingPath } = await import('./pending.mjs')
 
 let failures = 0
 let checks = 0
@@ -295,6 +295,12 @@ console.log('\n[7] 待批准权限清单')
   savePending([])
 
   check('清单路径与配置同目录', pendingPath().includes('dsh-mail-digest'), pendingPath())
+  // 回退位置：必须在插件目录里（工作区内，DSH 进程必然可写）。
+  // 这是「首选位置写不进去」时的兜底，实测踩过清单没落盘。
+  check('回退路径在插件目录内', pendingFallbackPath().includes('dsh-mail-digest'), pendingFallbackPath())
+  check('回退路径与首选路径不同', pendingFallbackPath() !== pendingPath())
+  savePending([])
+  check('activePendingPath 指向已存在的文件', activePendingPath() === pendingPath(), activePendingPath())
 }
 
 console.log('\n[8] mail_digest 工具带待批准权限参数')

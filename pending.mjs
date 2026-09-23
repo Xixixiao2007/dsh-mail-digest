@@ -12,11 +12,26 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { configPath } from './config.mjs'
 
-/** 清单文件放在配置文件旁边。 */
+/** 清单文件放在配置文件旁边（首选位置）。 */
 export function pendingPath() {
   return join(dirname(configPath()), 'pending-permissions.json')
+}
+
+/**
+ * 回退位置：插件目录里（插件装在工作区内，这个位置必然可写）。
+ *
+ * 为什么需要回退：实测出现过「清单没落盘」，而 savePending 的失败被 catch 吞掉。
+ * 不能假设 DSH 进程对 `~\.dsh` 的写权限和别处一致，所以多给一个可靠落点。
+ */
+export function pendingFallbackPath() {
+  try {
+    return join(dirname(fileURLToPath(import.meta.url)), 'pending-permissions.json')
+  } catch {
+    return ''
+  }
 }
 
 /** 单条待办的字段上限，避免邮件被撑爆。 */
@@ -40,42 +55,79 @@ function normalizeItem(raw, index) {
   }
 }
 
+/** 当前实际存在的清单路径；主路径优先（它是权威记录）。 */
+export function activePendingPath() {
+  const primary = pendingPath()
+  if (existsSync(primary)) return primary
+  const fallback = pendingFallbackPath()
+  if (fallback && existsSync(fallback)) return fallback
+  return primary
+}
+
 /**
- * 读待办清单。
+ * 读待办清单。主路径优先，不存在时读回退路径。
  * @returns {Array<{id: string, what: string, why: string, need: string, at: number}>}
  */
 export function loadPending() {
-  const path = pendingPath()
-  if (!existsSync(path)) return []
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'))
-    const list = Array.isArray(parsed) ? parsed : (parsed?.items ?? [])
-    return list.map(normalizeItem).filter(Boolean).slice(0, MAX_ITEMS)
-  } catch {
-    return []
+  for (const path of [pendingPath(), pendingFallbackPath()]) {
+    if (!path || !existsSync(path)) continue
+    try {
+      const parsed = JSON.parse(readFileSync(path, 'utf8'))
+      const list = Array.isArray(parsed) ? parsed : (parsed?.items ?? [])
+      const items = list.map(normalizeItem).filter(Boolean).slice(0, MAX_ITEMS)
+      // 空清单也认（它表示"已清空"，不该再去看回退文件里的旧数据）
+      return items
+    } catch {
+      continue
+    }
   }
+  return []
 }
 
 /**
  * 覆盖写入待办清单（原子写）。
+ *
+ * 先写首选位置（配置目录）；**失败则回退写插件目录**（工作区内，必然可写），
+ * 并把失败原因一并返回 —— 之前这里吞掉错误，导致「清单没落盘」查不出原因。
+ *
  * @param {Array} items - 新的清单。
- * @returns {{ok: boolean, count: number, path: string, error?: string}}
+ * @returns {{ok: boolean, count: number, path: string, fallback?: boolean, error?: string}}
  */
 export function savePending(items) {
-  const path = pendingPath()
   const list = (Array.isArray(items) ? items : [])
     .map(normalizeItem)
     .filter(Boolean)
     .slice(0, MAX_ITEMS)
-  try {
-    mkdirSync(dirname(path), { recursive: true })
-    const tmp = `${path}.tmp`
-    writeFileSync(tmp, `${JSON.stringify({ items: list, updatedAt: Date.now() }, null, 2)}\n`, 'utf8')
-    renameSync(tmp, path)
-    return { ok: true, count: list.length, path }
-  } catch (error) {
-    return { ok: false, count: list.length, path, error: error.message }
+  const payload = `${JSON.stringify({ items: list, updatedAt: Date.now() }, null, 2)}\n`
+
+  const primary = pendingPath()
+  const primaryError = (() => {
+    try {
+      mkdirSync(dirname(primary), { recursive: true })
+      const tmp = `${primary}.tmp`
+      writeFileSync(tmp, payload, 'utf8')
+      renameSync(tmp, primary)
+      return null
+    } catch (error) {
+      return error.message
+    }
+  })()
+  if (!primaryError) return { ok: true, count: list.length, path: primary }
+
+  // 首选位置失败 → 回退
+  const fallback = pendingFallbackPath()
+  if (fallback && fallback !== primary) {
+    try {
+      mkdirSync(dirname(fallback), { recursive: true })
+      const tmp = `${fallback}.tmp`
+      writeFileSync(tmp, payload, 'utf8')
+      renameSync(tmp, fallback)
+      return { ok: true, count: list.length, path: fallback, fallback: true, error: primaryError }
+    } catch (fallbackError) {
+      return { ok: false, count: list.length, path: primary, error: `${primaryError} / 回退也失败：${fallbackError.message}` }
+    }
   }
+  return { ok: false, count: list.length, path: primary, error: primaryError }
 }
 
 /**
