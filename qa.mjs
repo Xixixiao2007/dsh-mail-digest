@@ -235,20 +235,43 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
     // 精确性由下面的 token 校验保证（token 必须是**我们真的发出过**的）。
     const searchTerm = 'DSH-'
     const seen = new Map()
-    let found
-    try {
-      found = await fetchMails({
-        ...options,
-        marker: searchTerm,
-        unseenOnly: config.reply?.unseenOnly !== false,
-        // 163 等会把「自己回复自己」的邮件放进「已发送」，必须一起搜。
-        autoDiscover: true,
-        // 前缀搜索会多捞一些，limit 放宽，靠 token 精确筛。
-        limit: 20,
-      })
-    } catch (error) {
-      log('warn', `收信失败（搜 ${searchTerm}）：${error.message}`)
-      return
+
+    /**
+     * 收两轮：先只看未读（快、干净），**再全量兜一次**。
+     *
+     * 为什么要全量兜底（实测踩过）：用户的邮件客户端（手机 QQ 邮箱）会在他
+     * 看邮件时把邮件标成 `\Seen`；而配置里的 `unseenOnly=true` 会让插件只搜未读，
+     * 于是「用户已经批准的回复」被自己的客户端标已读后就再也搜不到了 ——
+     * 现象就是「我明明回了邮件批准，系统却按超时拒绝」。
+     *
+     * 全量会有噪声，但下面的 token 校验（必须是我们发出过的）足以筛干净，
+     * 而且 `consumedUids` 保证同一封不会被重复采纳。
+     */
+    const wantUnseenOnly = config.reply?.unseenOnly !== false
+    const passes = wantUnseenOnly ? [true, false] : [false]
+    let found = []
+    for (const unseenOnly of passes) {
+      try {
+        const batch = await fetchMails({
+          ...options,
+          marker: searchTerm,
+          unseenOnly,
+          // 163 等会把「自己回复自己」的邮件放进「已发送」，必须一起搜。
+          autoDiscover: true,
+          // 前缀搜索会多捞一些，limit 放宽，靠 token 精确筛。
+          limit: 20,
+        })
+        found = found.concat(batch)
+        // 未读那轮已经捞到东西就不必全量扫了（省一次 IMAP 往返）
+        if (unseenOnly && batch.length > 0) break
+      } catch (error) {
+        if (unseenOnly) {
+          log('warn', `收信失败（未读，搜 ${searchTerm}）：${error.message}，尝试全量`)
+          continue
+        }
+        log('warn', `收信失败（全量，搜 ${searchTerm}）：${error.message}`)
+        return
+      }
     }
     const stats = { fetched: found.length, threads: threads.size, matched: 0, ignored: 0 }
     for (const mail of found) if (!seen.has(mail.uid)) seen.set(mail.uid, mail)
