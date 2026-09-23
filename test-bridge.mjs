@@ -42,16 +42,25 @@ function mail({ uid, subject, from = ME, text = '继续吧', references = OUR_MI
 /** 建一个 bridge，收信实现由测试喂数据。 */
 function makeBridge(mails, { config = baseConfig, logSink = [], onFetch } = {}) {
   const log = (level, message) => { logSink.push(`${level}: ${message}`) }
+  /** 记录每次收信的 unseenOnly 取值：用来看"两轮是否都跑了"。 */
+  const passes = []
+  /** 记录被标为已读的邮件：只该包含**真的处理完**的那些。 */
+  const marked = []
   const bridge = createReplyBridge({
     getConfig: () => config,
     log,
     allowedSenders: () => config.to,
-    fetchRepliesImpl: async () => {
-      if (typeof onFetch === 'function') onFetch()
+    fetchRepliesImpl: async (options) => {
+      passes.push(options?.unseenOnly)
+      if (typeof onFetch === 'function') onFetch(options)
       return mails
     },
+    markSeenImpl: async ({ messages }) => {
+      for (const item of messages ?? []) marked.push(item.uid)
+      return { marked: (messages ?? []).length }
+    },
   })
-  return { bridge, logSink }
+  return { bridge, logSink, passes, marked }
 }
 
 const T_TOKEN = 't1aaaaaaaaaa'
@@ -451,6 +460,51 @@ console.log('\n[13] 审批通道：邮件批准 / 拒绝 / 不可识别')
   await bridge.pollOnce({})
   check('审批得到 reject', aOut?.decision === 'reject', JSON.stringify(aOut))
   check('提问得到答案（不被审批格式影响）', qOut?.items?.[0]?.selected?.[0] === '公开', JSON.stringify(qOut))
+  bridge.dispose()
+}
+
+console.log('\n[13] 标已读 + 两轮都跑（回归：2026-09-23 用户发现「未读堆积就读不到新信」）')
+{
+  // 用户实测：INBOX 46 封全是未读（插件从不标记已读），
+  // 而"未读那轮有返回就 break"会让全量兜底永远不跑 ——
+  // 结果就是"它忽然不认我的邮件了"，用户手动标已读后才恢复。
+  const delivered = []
+  const { bridge, passes, marked } = makeBridge([
+    mail({ uid: 101, subject: `Re: ${T_MARKER}`, text: '处理我' }),
+  ])
+  bridge.register({ token: T_TOKEN, marker: T_MARKER, sessionId: 's1', kind: 'T' })
+  bridge.noteSent(T_TOKEN, OUR_MID)
+  await bridge.pollOnce({ onConversationReply: (payload) => delivered.push(payload) })
+  check('★ 未读轮与全量轮都跑了（不再 break）', passes.includes(true) && passes.includes(false), JSON.stringify(passes))
+  check('处理完的回信被标为已读', marked.includes('101'), JSON.stringify(marked))
+  bridge.dispose()
+}
+
+console.log('\n[14] 没处理成功的回信绝不标已读（否则会吞掉用户还没搞定的事）')
+{
+  const cases = [
+    ['没有线程标记的外来邮件', mail({ uid: 201, subject: '阿里云到期提醒' })],
+    ['token 不是我们的', mail({ uid: 202, subject: 'Re: [DSH-T:zz9999999999]' })],
+    ['发件人不在白名单', mail({ uid: 203, subject: `Re: ${T_MARKER}`, from: 'stranger@evil.com' })],
+    ['References 对不上', mail({ uid: 204, subject: `Re: ${T_MARKER}`, references: '<other@x.com>' })],
+    ['陌生标记（线程表里没有）', mail({ uid: 205, subject: 'Re: [DSH-T:qqqqqqqqqqqq]' })],
+  ]
+  for (const [label, one] of cases) {
+    const { bridge, marked } = makeBridge([one])
+    bridge.register({ token: T_TOKEN, marker: T_MARKER, sessionId: 's1', kind: 'T' })
+    bridge.noteSent(T_TOKEN, OUR_MID)
+    await bridge.pollOnce({ onConversationReply: () => {} })
+    check(`${label} → 不标已读`, marked.length === 0, JSON.stringify(marked))
+    bridge.dispose()
+  }
+}
+
+console.log('\n[15] 审批已结束后的重复回信：不标已读（留着让用户看到）')
+{
+  const { bridge, marked } = makeBridge([mail({ uid: 301, subject: `Re: [DSH-A:aaaaaaaabbbb]`, text: '1' })])
+  // 故意不 register：线程表里没有 → 属于"忽略"，不该标记
+  await bridge.pollOnce({})
+  check('线程表里没有的审批回信不标已读', marked.length === 0, JSON.stringify(marked))
   bridge.dispose()
 }
 

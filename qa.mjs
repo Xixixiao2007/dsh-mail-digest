@@ -26,7 +26,7 @@
  *   ③ 回信的 References / In-Reply-To 要能对上我们那封邮件的 Message-ID
  *      （有些客户端会剥掉这两个头，此时靠 ①② 放行并在日志里记明）。
  */
-import { fetchReplies, IMAP_PRESETS } from './imap.mjs'
+import { fetchReplies, IMAP_PRESETS, markSeen } from './imap.mjs'
 import { matchAnswers, parseMailReply, approvalDecisionFrom } from './reply.mjs'
 
 /** 提问线程的存活上限：超时就把决定权交回界面。 */
@@ -109,8 +109,10 @@ export function threadFromSubject(subject) {
  * @param {Function} [deps.fetchRepliesImpl] - 收信实现，默认 imap.fetchReplies；测试可注入替身。
  * @returns {object} 编排器。
  */
-export function createReplyBridge({ getConfig, log, allowedSenders, fetchRepliesImpl }) {
+export function createReplyBridge({ getConfig, log, allowedSenders, fetchRepliesImpl, markSeenImpl }) {
   const fetchMails = typeof fetchRepliesImpl === 'function' ? fetchRepliesImpl : fetchReplies
+  // 标记已读的实现（测试可注入替身，避免真连 IMAP）。
+  const markMailsSeen = typeof markSeenImpl === 'function' ? markSeenImpl : markSeen
   /** token → {token, marker, sessionId, kind, questions, messageId, resolve, settled, timer} */
   const threads = new Map()
   /** 已经用掉的邮件 uid（避免重复采纳同一封回信）。 */
@@ -294,8 +296,11 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
           window: 400,
         })
         found = found.concat(batch)
-        // 未读那轮已经捞到东西就不必全量扫了（省一次 IMAP 往返）
-        if (unseenOnly && batch.length > 0) break
+        // ⚠ 这里原本写「未读那轮有返回就 break，省一次 IMAP 往返」——
+        // 那是一个会**累积**的缺陷：未读邮件越堆越多时，那一轮的名额被旧邮件占满，
+        // 用户新发的信反而读不到（实测 2026-09-23：INBOX 46 封全未读，
+        // 未读那轮只返回 1 封就把全量兜底跳过了，用户手动标已读后才恢复）。
+        // 现在两轮都跑：多一次 IMAP 往返，换"永不漏读"。
       } catch (error) {
         if (unseenOnly) {
           log('warn', `收信失败（未读，搜 ${searchTerm}）：${error.message}，尝试全量`)
@@ -309,26 +314,29 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
     for (const mail of found) if (!seen.has(mail.uid)) seen.set(mail.uid, mail)
     if (seen.size === 0) return
 
-    for (const mail of seen.values()) {
-      if (consumedUids.has(mail.uid)) continue
-      consumedUids.add(mail.uid)
-      if (consumedUids.size > 1000) {
-        const first = consumedUids.values().next().value
-        consumedUids.delete(first)
-      }
-
+    /**
+     * 处理一封候选邮件。
+     *
+     * @returns {Promise<boolean>} true = 已处理，可以把这封标为已读。
+     *
+     * 「已处理」的判定刻意严格：只有**真的把结论交出去了**才返回 true。
+     * 认不出、发件人不对、References 不匹配、解析不出内容、审批已结束、
+     * 投回会话失败 —— 一律返回 false，保持未读，让用户能看见、能重试。
+     * 标已读只该消灭"已经处理完的噪音"，绝不能吞掉"还没搞定的事情"。
+     */
+    async function handleMail(mail) {
       // ── 闸①：主题里必须是**我们真的发过**的那个 token ──────────────
       const thread = threadFromSubject(mail.subject)
       if (!thread) {
         stats.ignored++
         log('info', `忽略邮件（主题没有合法线程标记）：${String(mail.subject ?? '').slice(0, 60)}`)
-        continue
+        return false
       }
       const entry = threads.get(thread.token)
       if (!entry) {
         stats.ignored++
         log('info', `忽略邮件：标记 ${thread.token} 不是我们发出的（可能是外来邮件或被清理的旧线程）`)
-        continue
+        return false
       }
 
       // ── 闸②：发件人必须是配置的收件人（你自己） ──────────────────
@@ -336,7 +344,7 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
         const from = senderAddressOf(mail.from)
         if (!allowed.includes(from)) {
           log('warn', `忽略邮件：发件人 ${from || '(未知)'} 不在允许列表（${allowed.join(', ')}）`)
-          continue
+          return false
         }
       }
 
@@ -349,17 +357,17 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
         log('info', `回信没带 References 头，按标记+白名单放行（${thread.token}）`)
       } else if (!referenced) {
         log('warn', `忽略邮件：带了标记但不是在回复我们发出的邮件（${thread.token}）`)
-        continue
+        return false
       }
 
       const parsed = parseMailReply(mail)
-      if (parsed.answers.length === 0) continue
+      if (parsed.answers.length === 0) return false
 
       // ── 审批通道：回信决定「允许这一次 / 拒绝」 ──────────────────
       if (entry.kind === 'A') {
         if (entry.settled || !entry.resolve) {
           log('info', `审批已结束或已被界面处理（${thread.token}），忽略`)
-          continue
+          return false
         }
         // 审批不按「题号. 字母」解析，而是认明确的表态词或 1/2。
         // 原始正文优先（引用已剥），认不出来时再看 cleaned 主题。
@@ -372,37 +380,69 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
         threads.delete(thread.token)
         log('info', `收到邮件审批（${thread.token}）：${decision ?? '无法识别→拒绝'}`)
         entry.resolve({ decision: decision ?? 'reject' })
-        continue
+        return true
       }
 
       if (entry.kind === 'Q') {
         if (entry.settled || !entry.resolve) {
           log('info', `提问已结束或已被界面作答（${thread.token}），忽略`)
-          continue
+          return false
         }
         const { items, leftover } = matchAnswers(parsed.answers, entry.questions)
         if (items.length === 0) {
           log('warn', `回信没解析出可用答案（${thread.token}）`)
-          continue
+          return false
         }
         entry.settled = true
         if (entry.timer) clearTimeout(entry.timer)
         threads.delete(thread.token)
         log('info', `收到邮件答案（${thread.token}）：${items.map((i) => i.selected.join('/') || i.custom || '空').join(' | ')}`)
         entry.resolve({ items, leftover })
-        continue
+        return true
       }
 
       // 对话通道
-      if (typeof onConversationReply !== 'function') continue
+      if (typeof onConversationReply !== 'function') return false
       const text = parsed.answers.map((a) => a.custom || a.letters).filter(Boolean).join('\n').trim()
         || parsed.cleaned
-      if (!text) continue
+      if (!text) return false
       log('info', `收到对话回信（${thread.token}），投回会话`)
       try {
         await onConversationReply({ token: thread.token, sessionId: entry.sessionId, text, mail })
+        return true
       } catch (error) {
         log('warn', `把回信投回会话失败：${error.message}`)
+        return false
+      }
+    }
+
+    // 处理完的邮件收集起来，最后一次性标已读（同一个文件夹一条 STORE 搞定）。
+    const handledMails = []
+    for (const mail of seen.values()) {
+      if (consumedUids.has(mail.uid)) continue
+      consumedUids.add(mail.uid)
+      if (consumedUids.size > 1000) {
+        const first = consumedUids.values().next().value
+        consumedUids.delete(first)
+      }
+      let handled = false
+      try {
+        handled = await handleMail(mail)
+      } catch (error) {
+        log('warn', `处理邮件失败（${mail.uid}）：${error.message}`)
+      }
+      if (handled) handledMails.push({ uid: mail.uid, mailbox: mail.mailbox })
+    }
+
+    // ── 标已读 ────────────────────────────────────────────────────
+    // 不标的话未读会一直堆积，把「只看未读」那一轮的名额占满 ——
+    // 这正是用户 2026-09-23 发现的现象（手动标已读后才恢复）。
+    if (handledMails.length > 0 && config.reply?.markProcessedAsRead !== false) {
+      try {
+        const result = await markMailsSeen({ ...options, messages: handledMails })
+        if (result.marked > 0) log('info', `已把 ${result.marked} 封处理完的回信标为已读`)
+      } catch (error) {
+        log('warn', `标记已读失败（不影响本次处理）：${error.message}`)
       }
     }
   }

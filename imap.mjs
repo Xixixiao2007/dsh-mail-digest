@@ -755,6 +755,78 @@ export async function fetchRecent(options) {
 }
 
 /**
+ * 把若干邮件标为已读（`\Seen`）。
+ *
+ * ── 为什么需要这一步（2026-09-23 用户发现）──────────────────────
+ * 收信分两轮：先只看未读，再全量兜底。而「未读那轮有返回就跳过全量」这个优化
+ * 藏着一个会累积的缺陷：**只要未读邮件堆起来，那一轮的名额就被旧邮件占满**，
+ * 用户新发的信反而读不到 —— 表现就是"它忽然不认我的邮件了"，
+ * 用户手动把邮件标为已读之后又恢复正常（实测：当时 INBOX 46 封全是未读）。
+ *
+ * 所以处理完的邮件要标已读：让「未读」这个集合始终只包含**真正还没处理**的东西。
+ * 认不出来 / 没采纳的邮件**绝不标记**，留着让用户能看见、能重试。
+ *
+ * @param {object} options - 连接参数（同 fetchReplies），另有：
+ * @param {Array<{mailbox: string, uid: string}>} options.messages - 要标记的邮件。
+ * @returns {Promise<{marked: number}>} 实际标记成功的数量。
+ */
+export async function markSeen(options) {
+  const {
+    host,
+    port = 993,
+    secure = true,
+    rejectUnauthorized = true,
+    user,
+    pass,
+    messages,
+    timeoutMs = 20_000,
+  } = options ?? {}
+  const list = Array.isArray(messages) ? messages.filter((m) => m && m.uid && m.mailbox) : []
+  if (!host || !user || !pass || list.length === 0) return { marked: 0 }
+
+  // 按文件夹分组：同一个文件夹里的 UID 可以一条 STORE 搞定。
+  const byMailbox = new Map()
+  for (const item of list) {
+    const raw = String(item.uid)
+    const uid = raw.includes(':') ? raw.slice(raw.indexOf(':') + 1) : raw
+    if (!/^\d+$/.test(uid)) continue
+    if (!byMailbox.has(item.mailbox)) byMailbox.set(item.mailbox, new Set())
+    byMailbox.get(item.mailbox).add(uid)
+  }
+  if (byMailbox.size === 0) return { marked: 0 }
+
+  const connection = new ImapConnection(
+    await connect({ host, port, secure, rejectUnauthorized, timeoutMs }),
+    { timeoutMs },
+  )
+
+  let marked = 0
+  try {
+    const greeting = await connection.readLine()
+    if (!/^\*\s+(OK|PREAUTH)/i.test(greeting)) return { marked: 0 }
+    const login = await connection.run(`LOGIN ${quoteString(user)} ${quoteString(pass)}`)
+    if (!login.ok) return { marked: 0 }
+    // 163 / Coremail 要求先报身份，否则 SELECT 会被拒（Unsafe Login）。
+    await sendClientId(connection)
+
+    for (const [mailbox, uids] of byMailbox) {
+      const selected = await connection.run(`SELECT ${quoteString(mailbox)}`)
+      if (!selected.ok) continue
+      const set = [...uids].join(',')
+      const stored = await connection.run(`UID STORE ${set} +FLAGS.SILENT (\\Seen)`)
+      if (stored.ok) marked += uids.size
+    }
+    await connection.bye()
+    return { marked }
+  } catch {
+    // 标记已读失败不影响主流程（下一次轮询还会再看到这封邮件）。
+    return { marked }
+  } finally {
+    connection.close()
+  }
+}
+
+/**
  * 解析一条 IMAP LIST 应答，取出文件夹名。
  * 形如：`* LIST (\HasNoChildren) "/" "INBOX"`，名字可能是带引号的字符串或字面量。
  * @param {string} line - LIST 应答行。
