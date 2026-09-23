@@ -1,0 +1,6 @@
+# dsh-mail-digest bundle patch：把本插件挂进 profile 的插件树。
+# bundle patch 只是一段 loader patch，后面的 bundle 或 profile 自己的
+# cordis.patch.yml 都可以按 id 覆盖它。
+- insert:
+    - id: dsh-mail-digest
+      name: 'dsh-mail-digest'

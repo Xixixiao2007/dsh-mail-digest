@@ -1,0 +1,13 @@
+# 依赖与本地链接（dev 用的官方包 junction，不进仓库）
+node_modules/
+pnpm-lock.yaml
+
+# 本机配置 / 凭据
+config.json
+*.local.json
+
+# 临时文件
+*.tmp
+*.log
+.DS_Store
+Thumbs.db

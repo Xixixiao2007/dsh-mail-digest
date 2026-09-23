@@ -1,0 +1,35 @@
+{
+  "name": "dsh-mail-digest",
+  "version": "0.1.0",
+  "private": true,
+  "description": "每轮回答结束后，把一条详略得当的中文摘要发到你的邮箱（QQ / 163 / 自建 SMTP），地址在 DSH 设置页里配置。",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.mjs",
+    "digest.mjs",
+    "summary.mjs",
+    "smtp.mjs",
+    "config.mjs",
+    "settings.mjs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "email",
+    "digest",
+    "smtp"
+  ],
+  "license": "MIT"
+}
