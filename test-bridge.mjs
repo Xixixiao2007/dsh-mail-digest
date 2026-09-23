@@ -8,6 +8,7 @@
  */
 import { createReplyBridge, threadFromSubject } from './qa.mjs'
 import { parseListLine, pickMailboxes } from './imap.mjs'
+import { newThreadToken, threadMarker } from './reply.mjs'
 
 let failures = 0
 let checks = 0
@@ -341,6 +342,115 @@ console.log('\n[11] 主题标记的容错（真实事故：QQ 在标记里插空
   await bridge.pollOnce({ onConversationReply: (payload) => delivered.push(payload) })
   check('标记被插空格后回信仍能投递', delivered.length === 1, JSON.stringify(delivered))
   check('正文取到 B', delivered[0]?.text === 'B', JSON.stringify(delivered[0]?.text))
+  bridge.dispose()
+}
+
+console.log('\n[13] 审批通道：邮件批准 / 拒绝 / 不可识别')
+{
+  // 允许
+  const token = newThreadToken()
+  const marker = threadMarker('A', token)
+  let outcome = null
+  const { bridge } = makeBridge([
+    mail({ uid: 30, subject: `Re: [DSH] 🔐 需要你授权 pwsh ${marker}`, text: '1' }),
+  ])
+  bridge.register({ token, marker, sessionId: 's1', kind: 'A', resolve: (r) => { outcome = r } })
+  bridge.armApprovalTimeout(token)
+  bridge.noteSent(token, OUR_MID)
+  await bridge.pollOnce({})
+  check('回信 1 → allow', outcome?.decision === 'allow', JSON.stringify(outcome))
+  bridge.dispose()
+}
+{
+  // 拒绝
+  const token = newThreadToken()
+  const marker = threadMarker('A', token)
+  let outcome = null
+  const { bridge } = makeBridge([
+    mail({ uid: 31, subject: `Re: [DSH] 🔐 ${marker}`, text: '2' }),
+  ])
+  bridge.register({ token, marker, sessionId: 's1', kind: 'A', resolve: (r) => { outcome = r } })
+  bridge.armApprovalTimeout(token)
+  bridge.noteSent(token, OUR_MID)
+  await bridge.pollOnce({})
+  check('回信 2 → reject', outcome?.decision === 'reject', JSON.stringify(outcome))
+  bridge.dispose()
+}
+{
+  // 认不出 → fail closed（按拒绝）
+  const token = newThreadToken()
+  const marker = threadMarker('A', token)
+  let outcome = null
+  const logSink = []
+  const { bridge } = makeBridge([
+    mail({ uid: 32, subject: `Re: [DSH] 🔐 ${marker}`, text: '让我想想' }),
+  ], { logSink })
+  bridge.register({ token, marker, sessionId: 's1', kind: 'A', resolve: (r) => { outcome = r } })
+  bridge.armApprovalTimeout(token)
+  bridge.noteSent(token, OUR_MID)
+  await bridge.pollOnce({})
+  check('认不出表态 → 按拒绝（fail closed）', outcome?.decision === 'reject', JSON.stringify(outcome))
+  check('日志说明了原因', logSink.some((l) => l.includes('看不懂')), JSON.stringify(logSink.slice(0, 3)))
+  bridge.dispose()
+}
+{
+  // 标记被插空格 + 中文表态
+  const token = newThreadToken()
+  const marker = threadMarker('A', token)
+  const mangled = marker.replace(':', ' :').replace(/^\[/, '[ ')
+  let outcome = null
+  const { bridge } = makeBridge([
+    mail({ uid: 33, subject: `回复：[DSH] 🔐 ${mangled}`, text: '允许这一次' }),
+  ])
+  bridge.register({ token, marker, sessionId: 's1', kind: 'A', resolve: (r) => { outcome = r } })
+  bridge.armApprovalTimeout(token)
+  bridge.noteSent(token, OUR_MID)
+  await bridge.pollOnce({})
+  check('标记被改坏 + 中文表态 → allow', outcome?.decision === 'allow', JSON.stringify({ mangled, outcome }))
+  bridge.dispose()
+}
+{
+  // 界面先到：撤销邮件通道后，回信不再改结论
+  const token = newThreadToken()
+  const marker = threadMarker('A', token)
+  let outcome = null
+  const { bridge } = makeBridge([
+    mail({ uid: 34, subject: `Re: [DSH] 🔐 ${marker}`, text: '1' }),
+  ])
+  bridge.register({ token, marker, sessionId: 's1', kind: 'A', resolve: (r) => { outcome = r } })
+  bridge.noteSent(token, OUR_MID)
+  bridge.finish(token)          // 模拟界面先处理了
+  outcome = null
+  await bridge.pollOnce({})
+  check('界面先到后，邮件回信不再触发 resolve', outcome === null, JSON.stringify(outcome))
+  check('该线程已从已知标记里移除', !bridge.knownMarkers().includes(marker), JSON.stringify(bridge.knownMarkers()))
+  bridge.dispose()
+}
+{
+  // 审批与提问/对话三种线程共存，互不串台
+  const aTok = newThreadToken()
+  const qTok = newThreadToken()
+  const aMark = threadMarker('A', aTok)
+  const qMark = threadMarker('Q', qTok)
+  let aOut = null
+  let qOut = null
+  const { bridge } = makeBridge([
+    mail({ uid: 35, subject: `Re: ${aMark}`, text: '2' }),
+    mail({ uid: 36, subject: `Re: ${qMark}`, text: '1. A' }),
+  ])
+  bridge.register({ token: aTok, marker: aMark, sessionId: 's1', kind: 'A', resolve: (r) => { aOut = r } })
+  bridge.register({
+    token: qTok, marker: qMark, sessionId: 's1', kind: 'Q',
+    questions: [{ id: 'q1', question: 'x', options: [{ label: '公开' }] }],
+    resolve: (r) => { qOut = r },
+  })
+  bridge.noteSent(aTok, OUR_MID)
+  bridge.noteSent(qTok, OUR_MID)
+  bridge.armApprovalTimeout(aTok)
+  bridge.armTimeout(qTok)
+  await bridge.pollOnce({})
+  check('审批得到 reject', aOut?.decision === 'reject', JSON.stringify(aOut))
+  check('提问得到答案（不被审批格式影响）', qOut?.items?.[0]?.selected?.[0] === '公开', JSON.stringify(qOut))
   bridge.dispose()
 }
 

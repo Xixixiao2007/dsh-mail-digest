@@ -26,7 +26,7 @@ import {
 } from './config.mjs'
 import { blocksToText, cleanAnswerText, extractiveDigest, isAssistantTextEvent, normalizeDigest } from './digest.mjs'
 import { testImap } from './imap.mjs'
-import { createReplyBridge, imapOptions, imapReady, POLL_INTERVAL_MS } from './qa.mjs'
+import { createReplyBridge, imapOptions, imapReady, POLL_INTERVAL_MS, APPROVAL_TIMEOUT_MS } from './qa.mjs'
 import { newThreadToken, threadMarker } from './reply.mjs'
 import { loadPending, renderPendingBlock, savePending } from './pending.mjs'
 import { registerSettingsRoutes } from './settings.mjs'
@@ -733,6 +733,122 @@ export function apply(ctx) {
       if (!first.viaMail) return first.answer
       // 走到这里说明邮件分支赢了但没有可用答案（被撤销或超时）——等界面。
       return byInterface
+    })()
+  })
+
+  // ── 邮件审批：需要你放行的操作也走邮件 ────────────────────────────
+  //
+  // 挂到 approval/request 瀑布：返回 'allowed-once' 即认领这次审批，
+  // 调用 next() 则交给下一个应答者（界面对话框）。与提问通道同样「先到算谁」。
+  //
+  // ⚠ 安全边界（写清楚，不藏）：
+  //   1. 它**绕过不了** `never` 策略 —— 文档明确 never 在瀑布分发之前就强制 rejected。
+  //   2. 它把「批准能力」搬到了邮箱：邮箱被盗 = 批准能力被盗。
+  //      之所以还能接受：仍过三道闸（一次性随机 token + 发件人白名单 + References 比对原信），
+  //      且 **认不出表态就按拒绝处理（fail closed）**，绝不因"像同意"而放行。
+  async function sendApprovalMail({ title, toolName, reason, marker }) {
+    const config = getConfig()
+    const to = collectRecipients(config)
+    if (to.length === 0) return { ok: false, reason: '没有收件人' }
+    const lines = [
+      '⚠ 有一项操作需要你放行，我现在停在这里等你决定。',
+      '',
+      `工具：${toolName || '（未知）'}`,
+      `原因：${reason || '（调用方未说明）'}`,
+      `会话：${title || '（未命名会话）'}`,
+      `时间：${stamp()}`,
+      '',
+      '────────────',
+      '回复本邮件决定（保持主题不变，正文只写一个选项）：',
+      '',
+      '1. 允许这一次',
+      '2. 拒绝',
+      '',
+      `只放行这一次操作，不会记住为长期允许。超过 ${Math.round(APPROVAL_TIMEOUT_MS / 60000)} 分钟未回复则默认拒绝。`,
+    ]
+    const result = await deliver(config, {
+      from: senderAddress(config),
+      to,
+      subject: `${config.subjectPrefix ? `${config.subjectPrefix} ` : ''}🔐 需要你授权 ${toolName || ''} ${marker}`.replace(/\s+/g, ' ').trim(),
+      text: lines.join('\n'),
+    })
+    if (!result.ok) log('warn', `审批邮件发送失败：${result.reason}`)
+    return { ok: result.ok === true, messageId: result.messageId, reason: result.reason }
+  }
+
+  ctx.on('approval/request', (request, next) => {
+    const config = getConfig()
+    const shouldMail = config.enabled
+      && config.reply?.enabled === true
+      && config.reply?.askViaEmail === true
+      && imapReady(config)
+    if (!shouldMail) return next()
+
+    const sessionId = request?.agent?.id
+    // 界面通道照走（保留原生审批能力）。
+    // 用 async 包装，确保 next() 的同步异常不会在这里被吞掉。
+    const startInterface = async () => {
+      try {
+        return await next()
+      } catch (error) {
+        log('warn', `界面审批通道出错：${error.message}`)
+        return 'unavailable'
+      }
+    }
+    const byInterface = startInterface()
+
+    return (async () => {
+      const token = newThreadToken()
+      const marker = threadMarker('A', token)
+      let resolveDecision
+      const decisionPromise = new Promise((resolve) => { resolveDecision = resolve })
+      replyBridge.register({ token, marker, sessionId, kind: 'A', resolve: resolveDecision })
+      replyBridge.armApprovalTimeout(token)
+
+      try {
+        const sent = await sendApprovalMail({
+          title: titleFromAnywhere(sessionId),
+          toolName: request?.toolName,
+          reason: request?.reason,
+          marker,
+        })
+        if (!sent.ok) {
+          replyBridge.finish(token)
+          return byInterface
+        }
+        replyBridge.noteSent(token, sent.messageId)
+        log('info', `已把审批请求发到邮箱（${marker}，工具 ${request?.toolName || '?'}），等回信或界面决定`)
+      } catch (error) {
+        log('warn', `审批邮件发送失败：${error.message}`)
+        replyBridge.finish(token)
+        return byInterface
+      }
+
+      const byMail = decisionPromise.then((answer) => ({ viaMail: true, answer }))
+      const first = await Promise.race([
+        byMail,
+        byInterface.then((outcome) => ({ viaMail: false, outcome })),
+      ])
+
+      if (first.viaMail) {
+        const decision = first.answer?.decision
+        if (decision === 'allow') {
+          log('info', `邮件批准了这次操作（${marker}）—— 界面若还开着可以取消`)
+          return 'allowed-once'
+        }
+        if (decision === 'reject') {
+          log('info', `邮件拒绝了这次操作（${marker}）${first.answer?.timeout ? '（超时默认拒绝）' : ''}`)
+          return 'rejected'
+        }
+        // 撤销/未决：交回界面
+        log('info', `邮件审批未决（${marker}），交回界面`)
+        return byInterface
+      }
+
+      // 界面先到：撤销邮件通道，别让它之后再来改结论。
+      replyBridge.finish(token)
+      log('info', `界面先给出了审批结论（${first.outcome}）`)
+      return first.outcome
     })()
   })
 

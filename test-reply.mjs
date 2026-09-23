@@ -12,6 +12,7 @@ import {
   parseMailReply,
   parseReplyLines,
   threadMarker,
+  approvalDecisionFrom,
 } from './reply.mjs'
 import { senderAddressOf, threadFromSubject } from './qa.mjs'
 
@@ -259,6 +260,44 @@ for (const [label, from, expected] of [
   ['陌生地址', 'spam@evil.com', 'spam@evil.com'],
 ]) {
   check(`解析发件人：${label}`, senderAddressOf(from) === expected, senderAddressOf(from))
+}
+
+console.log('\n[12] 审批回信的决策解析（只认明确表态）')
+for (const [label, text, expected] of [
+  ['写 1', '1', 'allow'],
+  ['写 1.', '1.', 'allow'],
+  ['写（1）', '（1）', 'allow'],
+  ['写「允许」', '允许', 'allow'],
+  ['写「允许这一次」', '允许这一次', 'allow'],
+  ['写「批准」', '批准', 'allow'],
+  ['写「同意」', '同意', 'allow'],
+  ['写 allow', 'allow', 'allow'],
+  ['写 yes', 'yes', 'allow'],
+  ['写 2', '2', 'reject'],
+  ['写「拒绝」', '拒绝', 'reject'],
+  ['写「不允许」', '不允许', 'reject'],
+  ['写「不同意」', '不同意', 'reject'],
+  ['写 reject', 'reject', 'reject'],
+  ['写「不允许吧」', '不允许吧', 'reject'],
+  ['第一行有效', '1\n\n引用原文在这里', 'allow'],
+  ['带句号', '1。', 'allow'],
+  ['认不出的句子', '让我想想再告诉你', null],
+  ['空内容', '', null],
+  ['只有引用', '> 引用', null],
+]) {
+  check(`审批解析：${label}`, approvalDecisionFrom(text) === expected, JSON.stringify(approvalDecisionFrom(text)))
+}
+
+console.log('\n[13] 审批线程标记 DSH-A')
+{
+  const got = threadFromSubject('Re: [DSH] 🔐 需要你授权 pwsh [DSH-A:abc123def456]')
+  check('识别审批标记', got?.kind === 'A' && got?.token === 'abc123def456', JSON.stringify(got))
+  const mangled = threadFromSubject('回复：[DSH] 🔐 [D SH-A:abc123def456]')
+  check('被插空格也能认', mangled?.kind === 'A' && mangled?.token === 'abc123def456', JSON.stringify(mangled))
+  check('三种标记互不混淆',
+    threadFromSubject('[DSH-Q:aaaaaaaaaaaa]')?.kind === 'Q'
+    && threadFromSubject('[DSH-T:bbbbbbbbbbbb]')?.kind === 'T'
+    && threadFromSubject('[DSH-A:cccccccccccc]')?.kind === 'A')
 }
 
 console.log(`\n${failures === 0 ? '全部通过' : '有失败项'}：${checks - failures}/${checks}\n`)

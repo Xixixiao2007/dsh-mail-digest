@@ -27,10 +27,12 @@
  *      （有些客户端会剥掉这两个头，此时靠 ①② 放行并在日志里记明）。
  */
 import { fetchReplies, IMAP_PRESETS } from './imap.mjs'
-import { matchAnswers, parseMailReply } from './reply.mjs'
+import { matchAnswers, parseMailReply, approvalDecisionFrom } from './reply.mjs'
 
 /** 提问线程的存活上限：超时就把决定权交回界面。 */
 const QUESTION_TIMEOUT_MS = 30 * 60_000
+/** 审批线程的存活上限：超时按拒绝处理（fail closed）。 */
+const APPROVAL_TIMEOUT_MS = 10 * 60_000
 /** 轮询收件箱的间隔。 */
 const POLL_INTERVAL_MS = 15_000
 /** 最多记住多少条已发线程（够覆盖最近的历史，避免无限增长）。 */
@@ -65,32 +67,32 @@ export function senderAddressOf(from) {
 }
 
 /**
- * 认「写全」的线程标记：`[DSH-Q:token]` / `[DSH-T:token]`。
+ * 认「写全」的线程标记：`[DSH-Q:token]`（提问）/ `[DSH-T:token]`（对话）/ `[DSH-A:token]`（审批）。
  * 落在主题任意位置即可（`Re:` / `回复：` 前缀随便），token 必须是 6~32 位字母数字。
  *
  * ── 为什么要容忍标记内部的空格 ──────────────────────────────────
- * 实测 QQ 邮箱在回复时会把长主题**按显示宽度插入换行/空格**，把
- * `[DSH-Q:e2jdvd7izt50]` 变成 `[D SH-Q:e2jdvd7izt50]`（甚至更多空格）。
- * 严格匹配会让这种回信被当成「外来邮件」丢弃。
+ * 实测 QQ 邮箱（含手机 App）在回复时会把长主题**按显示宽度插入空格**，把
+ * `[DSH-Q:e2jdvd7izt50]` 变成 `[D SH-Q:e2jdvd7izt50]`、甚至把 token 中间断开
+ * （`[DSH-T:wk1fbajmv3 bj]`）。严格匹配会让这种回信被当成「外来邮件」丢弃。
  *
  * 安全性没有因此下降：token 是我们自己生成的 12 位随机串，**必须在已知线程表里**
  * 才会被采纳（见 pollOnce 的闸①「不是我们发出的」）。容忍空格只是恢复被客户端
  * 破坏的标记，不会让无关邮件匹配上。
  *
  * @param {string} subject - 已解码的原始主题。
- * @returns {{kind: 'Q'|'T', token: string} | null}
+ * @returns {{kind: 'Q'|'T'|'A', token: string} | null}
  */
 export function threadFromSubject(subject) {
   const text = String(subject ?? '')
   // 1) 严格：标记完整无空格
-  const strict = /\[DSH-([QT]):([a-z0-9]{6,32})\]/i.exec(text)
+  const strict = /\[DSH-([QTA]):([a-z0-9]{6,32})\]/i.exec(text)
   if (strict) return { kind: strict[1].toUpperCase(), token: strict[2].toLowerCase() }
   // 2) 容忍：`[` 到 `]` 之间允许空白（含客户端折行插入的）
   const loose = /\[([^\]]{0,80})\]/g
   let found
   while ((found = loose.exec(text)) !== null) {
     const compact = found[1].replace(/\s+/g, '')
-    const parsed = /^DSH-([QT]):([a-z0-9]{6,32})$/i.exec(compact)
+    const parsed = /^DSH-([QTA]):([a-z0-9]{6,32})$/i.exec(compact)
     if (parsed) return { kind: parsed[1].toUpperCase(), token: parsed[2].toLowerCase() }
   }
   return null
@@ -118,7 +120,8 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
       token: thread.token,
       marker: thread.marker,
       sessionId: thread.sessionId,
-      kind: thread.kind === 'Q' ? 'Q' : 'T',
+      // 三种线程：Q 提问作答 / T 对话续接 / A 审批决定
+      kind: ['Q', 'T', 'A'].includes(thread.kind) ? thread.kind : 'T',
       questions: Array.isArray(thread.questions) ? thread.questions : [],
       messageId: '',
       resolve: typeof thread.resolve === 'function' ? thread.resolve : null,
@@ -173,6 +176,26 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
       threads.delete(token)
       entry.resolve({ items: [], leftover: '', timeout: true })
     }, QUESTION_TIMEOUT_MS)
+    entry.timer.unref?.()
+  }
+
+  /**
+   * 给审批线程挂超时，**走 fail-closed**：超时即拒绝，而不是一律交回界面。
+   *
+   * 理由：审批涉及的正是「需要放行才能做」的操作。超时后若交给界面继续等，
+   * 任务会一直挂着（就是那个「硬控」）；明确拒绝则让任务快速失败、把决定留给下一轮。
+   * 界面若抢先作答，走的是 `finish()`/答案路径，不会受这里影响。
+   */
+  function armApprovalTimeout(token) {
+    const entry = threads.get(token)
+    if (!entry || !entry.resolve) return
+    entry.timer = setTimeout(() => {
+      if (entry.settled) return
+      log('info', `审批邮件超时未回复（${entry.marker}），按拒绝处理（fail closed）`)
+      entry.settled = true
+      threads.delete(token)
+      entry.resolve({ decision: 'reject', timeout: true })
+    }, APPROVAL_TIMEOUT_MS)
     entry.timer.unref?.()
   }
 
@@ -271,6 +294,26 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
       const parsed = parseMailReply(mail)
       if (parsed.answers.length === 0) continue
 
+      // ── 审批通道：回信决定「允许这一次 / 拒绝」 ──────────────────
+      if (entry.kind === 'A') {
+        if (entry.settled || !entry.resolve) {
+          log('info', `审批已结束或已被界面处理（${thread.token}），忽略`)
+          continue
+        }
+        // 审批不按「题号. 字母」解析，而是认明确的表态词或 1/2。
+        // 原始正文优先（引用已剥），认不出来时再看 cleaned 主题。
+        const decision = approvalDecisionFrom(mail.text) ?? approvalDecisionFrom(parsed.cleaned)
+        if (!decision) {
+          log('warn', `审批回信看不懂（${thread.token}），按拒绝处理（fail closed）`)
+        }
+        entry.settled = true
+        if (entry.timer) clearTimeout(entry.timer)
+        threads.delete(thread.token)
+        log('info', `收到邮件审批（${thread.token}）：${decision ?? '无法识别→拒绝'}`)
+        entry.resolve({ decision: decision ?? 'reject' })
+        continue
+      }
+
       if (entry.kind === 'Q') {
         if (entry.settled || !entry.resolve) {
           log('info', `提问已结束或已被界面作答（${thread.token}），忽略`)
@@ -308,6 +351,7 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
     noteSent,
     finish,
     armTimeout,
+    armApprovalTimeout,
     pollOnce,
     knownMarkers,
     get pendingCount() { return [...threads.values()].filter((entry) => !entry.settled).length },
@@ -317,4 +361,4 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
   }
 }
 
-export { POLL_INTERVAL_MS, QUESTION_TIMEOUT_MS }
+export { POLL_INTERVAL_MS, QUESTION_TIMEOUT_MS, APPROVAL_TIMEOUT_MS }

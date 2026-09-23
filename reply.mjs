@@ -349,9 +349,39 @@ function stripBodyNoise(text) {
 }
 
 /**
+ * 把一封**审批**回信的内容解析成决策。
+ *
+ * 认这些写法（大小写、中英文都认）：
+ *   允许 → `1` / `1.` / `允许` / `批准` / `同意` / `allow` / `yes`
+ *   拒绝 → `2` / `2.` / `拒绝` / `不允许` / `不同意` / `reject` / `no`
+ *
+ * 刻意**只认明确表态**：认不出来返回 null，由调用方按 fail-closed 处理 ——
+ * 绝不因为"看起来像同意"就放行。
+ *
+ * @param {string} text - 回信正文或清理后的主题。
+ * @returns {'allow'|'reject'|null}
+ */
+export function approvalDecisionFrom(text) {
+  // 只看第一行有效内容：审批回信应当很短，后面通常是引用原文
+  const first = String(text ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)[0] ?? ''
+  const body = first.replace(/^[-*\s]+/, '').replace(/[。.!！\s]+$/, '')
+  if (!body) return null
+  // 注意顺序：先判否定词，"不允许" 必须在 "允许" 之前判掉
+  if (/不允许|不同意|拒绝|驳回|不要|别批|reject|deny|\bno\b/i.test(body)) return 'reject'
+  if (/允许|批准|同意|放行|可以|ok|allow|approve|\byes\b/i.test(body)) return 'allow'
+  // 纯选项编号（可带 . ) 、 ： 等）
+  if (/^[（(]?2[)）.、:：]?\s*$/.test(body)) return 'reject'
+  if (/^[（(]?1[)）.、:：]?\s*$/.test(body)) return 'allow'
+  return null
+}
+
+/**
  * 生成线程标记：同时用于「主题里能被搜索到」和「回信对上会话」。
  * 必须是纯 ASCII，才能用 IMAP 的 SUBJECT 搜索。
- * @param {string} prefix - 类别前缀，如 Q（提问）/ T（回答）。
+ * @param {string} prefix - 类别前缀：Q（提问）/ T（对话）/ A（审批）。
  * @param {string} token - 已经生成的 token。
  * @returns {string} 形如 `[DSH-Q:abc123]`。
  */
