@@ -135,8 +135,28 @@
 **DSH 没有"插件内置 skill"的机制。** 插件就是 bundle（`dsh.bundle.patch`），
 skill 是另一套东西、装在 `~/.dsh/skills/`，给 **agent** 看的操作知识，两者发布上分开。
 
-所以本仓库的约定：
+那 agent 怎么知道这个插件的规则？靠三层，已全部落实：
 
-- `README.md` —— 面向**用户**：能解决什么问题、怎么装、怎么用。
-- 本文件 —— 面向**agent / 维护者**：实现细节与踩坑记录。
-- 顶层的 `dsh-plugin-mgmt` 技能（不在本仓库）—— 安装/发布流程类的通用知识。
+| 层 | 载体 | 谁会被覆盖到 |
+| --- | --- | --- |
+| ① 工具描述 | `index.mjs` 里 `mail_digest` 的 `description` / 参数描述 | 任何会话，agent 看到工具时 |
+| ② 用户全局指令 | 安装脚本写入 `$DSH_HOME/AGENTS.md` 的**托管区块** | **任何会话，自动加载** |
+| ③ 仓库内指令 | 仓库根的 `AGENTS.md` | agent 在本仓库工作时 |
+
+② 的实现要点：
+
+- DSH 的 `@deepseek-ai/dsh-agent-instructions` 自动加载 `$DSH_HOME/AGENTS.md`
+  （用户全局）与项目内的 `AGENTS.md` / `CLAUDE.md`，`dsh-base` 默认启用它。
+  **实测有效**：新建该文件后，DSH 立刻以 "Additional instructions from: ..." 注入。
+- 写入时用成对标记 `<!-- BEGIN dsh-mail-digest ... -->` / `<!-- END dsh-mail-digest -->`
+  圈出托管区块：可反复安装（替换而非追加）、卸载只删自己那段、不碰用户其它内容。
+- 写出的文件**不带 BOM**（带 BOM 在部分工具链里会被当成异常字符）。
+- 正则要用 `(?s)` 让 `.` 跨行 —— 托管区块一定是多行的。
+- 读取一律显式 `[string]` 转换：`Get-Content` 在某些情况下返回数组，
+  那时 `.Trim()` / `-match` 行为完全不同（实测导致幂等替换失效、卸载删不掉）。
+- `.ps1` 必须带 UTF-8 BOM：Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当 ANSI 读，
+  中文变乱码并引发**假的语法错误**（`edit` 工具会剥掉 BOM，改完要补回）。
+
+规则的**内容**单一来源是 `AGENTS.dsh-mail-digest.md`（带标记的模板）；
+仓库根的 `AGENTS.md` 是同一套规则的人读版（面向"改这个仓库"的场景）。
+

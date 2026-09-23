@@ -27,7 +27,9 @@
     "settings.mjs",
     "cordis.patch.yml",
     "README.md",
-    "DEVELOPMENT.md"
+    "DEVELOPMENT.md",
+    "AGENTS.md",
+    "AGENTS.dsh-mail-digest.md"
   ],
   "keywords": [
     "dsh-plugin",

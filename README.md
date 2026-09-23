@@ -151,6 +151,24 @@ http://127.0.0.1:3080/dsh-mail-digest
 - 清单**持久化**存盘（`pending-permissions.json`，与配置文件同目录），DSH 重启不丢
 - 清单为空时，邮件里**不会**出现这个区块
 
+## 装完之后 agent 怎么知道规则
+
+这个插件除了收发邮件，还带一套**给 agent 的规则**（摘要怎么写、回信怎么读、
+什么情况下申请权限）。规则通过三层让 agent 知道：
+
+| 层 | 位置 | 生效范围 |
+| --- | --- | --- |
+| ① 工具描述 | 插件内置 | 任何会话，agent 看到 `mail_digest` 工具时 |
+| ② **用户全局指令** | `~/.dsh/AGENTS.md` | **任何会话，自动加载**（由 DSH 的 `dsh-agent-instructions` 提供） |
+| ③ 仓库内指令 | 本仓库的 `AGENTS.md` | agent 在本仓库里工作时 |
+
+安装脚本会自动把规则写进 ②：写成一个**带标记的托管区块**，可反复安装（替换而非追加），
+卸载时只删自己那一块、不动你写的其它内容。写出的 `AGENTS.md` **不带 BOM**。
+
+- 规则内容见 [`AGENTS.dsh-mail-digest.md`](./AGENTS.dsh-mail-digest.md)
+- 不想让 agent 收到这些规则：跑 `-Uninstall`，或手动删 `~/.dsh/AGENTS.md` 里
+  `<!-- BEGIN dsh-mail-digest -->` 到 `<!-- END dsh-mail-digest -->` 之间的内容
+
 ## 安全说明
 
 ### 为什么不会被随机邮件骗到

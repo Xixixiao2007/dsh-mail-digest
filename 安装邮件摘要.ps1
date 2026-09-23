@@ -31,6 +31,83 @@ function Step($text) { Write-Host ''; Write-Host "── $text" }
 function Info($text) { Write-Host "   $text" }
 function Warn($text) { Write-Host "   ! $text" -ForegroundColor Yellow }
 
+# ── agent 工作规则：写进用户全局指令 ──────────────────────────────
+#
+# 为什么需要：插件除了收发邮件，还暗含一套**给 agent 的规则**（摘要怎么写、
+# 回信怎么读、默认不申请提权）。光靠工具描述不够 —— 那些规则要在**任何**会话里
+# 都生效。DSH 会自动加载 `$DSH_HOME\AGENTS.md` 作为「用户全局指令」
+# （由 dsh-agent-instructions 提供，dsh-base 默认启用），所以把规则写进那里。
+#
+# 用成对标记圈出托管区块：可反复安装（替换而不是追加），卸载时只删自己那段，
+# 不碰用户自己写的其它内容。
+$AgentRulesBegin = '<!-- BEGIN dsh-mail-digest (managed by 安装邮件摘要.ps1, do not edit inside) -->'
+$AgentRulesEnd = '<!-- END dsh-mail-digest -->'
+$AgentRulesFile = 'AGENTS.dsh-mail-digest.md'
+
+function Install-AgentRules {
+  param([string]$DshHome, [string]$PluginDir)
+
+  $templatePath = Join-Path $PluginDir $AgentRulesFile
+  if (-not (Test-Path $templatePath)) {
+    Warn "没找到规则模板 $AgentRulesFile，跳过用户全局指令写入"
+    return
+  }
+  $target = Join-Path $DshHome 'AGENTS.md'
+  # 一律显式转 [string]：Get-Content 在某些情况下会返回数组，
+  # 那时 .Trim() / -match 行为完全不同（实测导致幂等替换失效、卸载删不掉）。
+  $block = [string]((Get-Content $templatePath -Raw -Encoding UTF8) -replace "`r`n", "`n")
+
+  # 读现有内容（可能不存在）。**不带 BOM** 写回：带 BOM 的 AGENTS.md 在部分
+  # 工具链里会被当成异常字符。用 .NET 显式指定 UTF8(no BOM) 最稳。
+  $existing = ''
+  if (Test-Path $target) { $existing = [string]((Get-Content $target -Raw -Encoding UTF8) -replace "`r`n", "`n") }
+
+  $pattern = [regex]::Escape($AgentRulesBegin) + '(?s).*?' + [regex]::Escape($AgentRulesEnd)
+  $merged = $null
+  if ($existing -match $pattern) {
+    $merged = [regex]::Replace($existing, $pattern, { param($m) $block })
+    Info '用户全局指令：已更新托管区块'
+  } elseif ($existing.Trim().Length -gt 0) {
+    $merged = $existing.TrimEnd() + "`n`n" + $block
+    Info '用户全局指令：已追加托管区块（保留原有内容）'
+  } else {
+    $merged = $block
+    Info '用户全局指令：已创建'
+  }
+
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($target, $merged, $utf8)
+  Info "写入：$target"
+  Info 'DSH 会在每个会话自动加载它（dsh-agent-instructions）'
+}
+
+function Uninstall-AgentRules {
+  param([string]$DshHome)
+
+  $target = Join-Path $DshHome 'AGENTS.md'
+  if (-not (Test-Path $target)) {
+    Info '用户全局指令：文件不存在，无需清理'
+    return
+  }
+  $existing = [string]((Get-Content $target -Raw -Encoding UTF8) -replace "`r`n", "`n")
+  # (?s) 让 . 能跨行匹配 —— 托管区块一定是多行的。
+  $pattern = [regex]::Escape($AgentRulesBegin) + '(?s).*?' + [regex]::Escape($AgentRulesEnd)
+  if ($existing -notmatch $pattern) {
+    Info '用户全局指令：没有我们的托管区块，保持原样'
+    return
+  }
+  # 删掉区块，并把留下的多余空行收敛一下。
+  $merged = ([regex]::Replace($existing, $pattern, '')).Trim()
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  if ($merged.Length -gt 0) {
+    [System.IO.File]::WriteAllText($target, $merged + "`n", $utf8)
+    Info '用户全局指令：已移除托管区块（其余内容保留）'
+  } else {
+    Remove-Item $target -Force
+    Info '用户全局指令：移除后为空，已删除该文件'
+  }
+}
+
 Say ''
 Say '=== dsh-mail-digest 安装器 ==='
 
@@ -167,6 +244,10 @@ if ($pnpmCmd) {
 # ── 4. 卸载分支 ────────────────────────────────────────────────────
 if ($Uninstall) {
   Step "4. 卸载 $PackageName"
+
+  # 先移除我们写进用户全局指令的托管区块（只删自己那一段，别动用户其它内容）。
+  Uninstall-AgentRules -DshHome $DshHome
+
   & $Dsh plugin --profile $ProfileName remove $PackageName
   $code = $LASTEXITCODE
   Say ''
@@ -274,6 +355,11 @@ $code = $LASTEXITCODE
 
 Say ''
 if ($code -eq 0) {
+  # ── 7. 写 agent 工作规则到用户全局指令 ──────────────────────────
+  Step '7. 写入 agent 工作规则（用户全局指令）'
+  Install-AgentRules -DshHome $DshHome -PluginDir $PluginDir
+
+  Say ''
   Say '✓ 安装成功。'
   Say ''
   Say '接下来：'
@@ -283,6 +369,9 @@ if ($code -eq 0) {
   Say '  4. 点「保存」，再点「发送测试邮件」；要用回信功能再点「测试收信」'
   Say ''
   Say "配置存在：$(Join-Path $DshHome $PackageName)\config.json"
+  Say ''
+  Say '规则已写入用户全局指令，agent 从下一个会话起就会遵守；'
+  Say '不想要可以跑 -Uninstall 移除（只会删自己那一块，不动你写的其它内容）。'
 } else {
   Say "✗ 安装失败（退出码 $code）。"
   Say '  把上面的报错整段发我；也可以先跑 -DryRun 看探测结果。'
