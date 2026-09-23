@@ -35,6 +35,8 @@ const QUESTION_TIMEOUT_MS = 30 * 60_000
 const APPROVAL_TIMEOUT_MS = 10 * 60_000
 /** 轮询收件箱的间隔。 */
 const POLL_INTERVAL_MS = 15_000
+/** 有待处理线程（尤其是审批）时的轮询间隔：更勤，因为用户正卡在那里等。 */
+const APPROVAL_POLL_MS = 5_000
 /** 最多记住多少条已发线程（够覆盖最近的历史，避免无限增长）。 */
 const MAX_THREADS = 500
 
@@ -233,8 +235,9 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
     // 精确性由下面的 token 校验保证（token 必须是**我们真的发出过**的）。
     const searchTerm = 'DSH-'
     const seen = new Map()
+    let found
     try {
-      const found = await fetchMails({
+      found = await fetchMails({
         ...options,
         marker: searchTerm,
         unseenOnly: config.reply?.unseenOnly !== false,
@@ -243,11 +246,12 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
         // 前缀搜索会多捞一些，limit 放宽，靠 token 精确筛。
         limit: 20,
       })
-      for (const mail of found) if (!seen.has(mail.uid)) seen.set(mail.uid, mail)
     } catch (error) {
       log('warn', `收信失败（搜 ${searchTerm}）：${error.message}`)
       return
     }
+    const stats = { fetched: found.length, threads: threads.size, matched: 0, ignored: 0 }
+    for (const mail of found) if (!seen.has(mail.uid)) seen.set(mail.uid, mail)
     if (seen.size === 0) return
 
     for (const mail of seen.values()) {
@@ -261,11 +265,13 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
       // ── 闸①：主题里必须是**我们真的发过**的那个 token ──────────────
       const thread = threadFromSubject(mail.subject)
       if (!thread) {
+        stats.ignored++
         log('info', `忽略邮件（主题没有合法线程标记）：${String(mail.subject ?? '').slice(0, 60)}`)
         continue
       }
       const entry = threads.get(thread.token)
       if (!entry) {
+        stats.ignored++
         log('info', `忽略邮件：标记 ${thread.token} 不是我们发出的（可能是外来邮件或被清理的旧线程）`)
         continue
       }
@@ -361,4 +367,4 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
   }
 }
 
-export { POLL_INTERVAL_MS, QUESTION_TIMEOUT_MS, APPROVAL_TIMEOUT_MS }
+export { POLL_INTERVAL_MS, APPROVAL_POLL_MS, QUESTION_TIMEOUT_MS, APPROVAL_TIMEOUT_MS }

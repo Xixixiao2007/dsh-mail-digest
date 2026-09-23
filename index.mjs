@@ -26,7 +26,7 @@ import {
 } from './config.mjs'
 import { blocksToText, cleanAnswerText, extractiveDigest, isAssistantTextEvent, normalizeDigest } from './digest.mjs'
 import { testImap } from './imap.mjs'
-import { createReplyBridge, imapOptions, imapReady, POLL_INTERVAL_MS, APPROVAL_TIMEOUT_MS } from './qa.mjs'
+import { createReplyBridge, imapOptions, imapReady, APPROVAL_POLL_MS, APPROVAL_TIMEOUT_MS } from './qa.mjs'
 import { newThreadToken, threadMarker } from './reply.mjs'
 import { loadPending, renderPendingBlock, savePending } from './pending.mjs'
 import { registerSettingsRoutes } from './settings.mjs'
@@ -852,9 +852,15 @@ export function apply(ctx) {
     })()
   })
 
-  // 定时收信：处理回信（提问答案 / 对话续接）。
+  // 定时收信：处理回信（提问答案 / 对话续接 / 审批决定）。
+  // 有审批线程时收得更勤（5 秒），因为审批对延迟敏感 —— 用户正卡在那里等。
   ctx.effect(() => {
+    let ticks = 0
     const timer = setInterval(() => {
+      ticks += 1
+      // 有待审批或待答线程时每轮都收；空闲时按更慢的节奏（省一次 IMAP 往返）
+      const busy = replyBridge.pendingCount > 0
+      if (!busy && ticks % 3 !== 0) return
       void replyBridge.pollOnce({
         onConversationReply: ({ sessionId, text }) => {
           const agents = ctx.get('agents')
@@ -877,7 +883,7 @@ export function apply(ctx) {
           log('info', `已把邮件回信作为新消息投回会话 ${sessionId}`)
         },
       })
-    }, POLL_INTERVAL_MS)
+    }, APPROVAL_POLL_MS)
     timer.unref?.()
     return () => {
       clearInterval(timer)
