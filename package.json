@@ -19,10 +19,15 @@
     "digest.mjs",
     "summary.mjs",
     "smtp.mjs",
+    "imap.mjs",
+    "qa.mjs",
+    "reply.mjs",
+    "pending.mjs",
     "config.mjs",
     "settings.mjs",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "DEVELOPMENT.md"
   ],
   "keywords": [
     "dsh-plugin",
