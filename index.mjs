@@ -113,6 +113,10 @@ export function apply(ctx) {
   const titles = new Map()
   /** 发信时间戳，用于节流。 */
   const sentAt = []
+  /** 最近一次「待批准」即时通知的时间，避免同一轮多次调用把用户邮箱刷爆。 */
+  let lastPendingNotifyAt = 0
+  /** 两条「待批准」通知的最小间隔。 */
+  const PENDING_NOTIFY_GAP_MS = 30_000
   /** 最近一次发信结果（诊断用）。 */
   let lastResult = null
 
@@ -506,8 +510,11 @@ export function apply(ctx) {
         type: 'array',
         description:
           '需要用户批准的权限/操作清单，会以独立区块显示在邮件里（每次发信都带上）。'
-          + '用法：把你因为「需要提权才能做」而**暂时没做**的事记在这里；'
-          + '用户批准并做完之后，用空数组 [] 清空。'
+          + '【硬性纪律】默认**不要申请提权**：申请本身会让 agent 停在等待审批上，'
+          + '而用户不在电脑前就批不了（等同被硬控）。只有用户明确说「去申请」才申请。'
+          + '判断用户可能不在场的信号：他用**邮件回复**你，而不是在界面上打字。'
+          + '遇到需要放行才能做的事，就记在这份清单里等他回来一次看完。'
+          + '用法：把因为需要提权而**暂时没做**的事记在这里；用户批准并做完后，用空数组 [] 清空。'
           + '只写真的需要用户放行的事（通常是要写工作区之外的路径）。',
         items: {
           type: 'object',
@@ -563,6 +570,43 @@ export function apply(ctx) {
         pendingError = saved.error
         if (saved.ok) log('info', `待批准权限清单更新为 ${saved.count} 项（${saved.path}${saved.fallback ? '，回退位置' : ''}）`)
         else log('warn', `待批准权限清单写入失败（${saved.path}）：${saved.error}`)
+
+        // ── 立即补发一封通知 ──────────────────────────────────────────
+        // 为什么不等回合结束：插件只在 turn/end 发摘要，而这轮里写入的清单
+        // 可能在同一轮内又被清空/改写，等发信时看到的是"最终态"，
+        // 用户就看不到"当时待他批的是什么"。实测踩过：同一轮先写 1 项再传 []，
+        // 结果那封邮件里没有区块，用户以为功能坏了。
+        if (saved.ok && saved.count > 0) {
+          const now = Date.now()
+          if (now - lastPendingNotifyAt > PENDING_NOTIFY_GAP_MS) {
+            lastPendingNotifyAt = now
+            const config = getConfig()
+            if (config.enabled && config.digestMode !== 'off') {
+              const sessionId = exec.agent?.id
+              const title = titleFromAnywhere(sessionId)
+              const lines = [
+                `有 ${saved.count} 项操作需要你放行，我现在不做，等你有空批。`,
+                '',
+                renderPendingBlock(loadPending()).trim(),
+                '',
+                '────────────',
+                `会话：${title || '（未命名会话）'}`,
+                `时间：${stamp()}`,
+                '',
+                '回复本邮件说明也可以（比如「都批准」或「第 2 项先别做」）。',
+              ]
+              void deliver(config, {
+                from: senderAddress(config),
+                to: collectRecipients(config),
+                subject: `${config.subjectPrefix ? `${config.subjectPrefix} ` : ''}⚠ ${saved.count} 项待批准`,
+                text: lines.join('\n'),
+              }).catch(() => {})
+              log('info', `已立即补发「${saved.count} 项待批准」通知邮件`)
+            }
+          } else {
+            log('info', `待批准通知刚发过，${Math.round(PENDING_NOTIFY_GAP_MS / 1000)} 秒内不重复发`)
+          }
+        }
       }
       const base = {
         accepted: false,
