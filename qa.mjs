@@ -140,9 +140,18 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
     return entry
   }
 
-  /** 收信时要知道去搜哪些标记。 */
+  /**
+   * 收信时要知道去搜哪些标记。
+   *
+   * 顺序有意「新 → 旧」：`fetchReplies` 会用这些标记做服务端精确定位（受条数上限约束），
+   * 而用户正在等的是**最近发出的那几封**（审批/提问），所以新的必须排前面。
+   */
   function knownMarkers() {
-    return [...new Set([...threads.values()].map((entry) => entry.marker))].filter(Boolean)
+    return [...threads.values()]
+      .sort((a, b) => b.at - a.at)
+      .map((entry) => entry.marker)
+      .filter(Boolean)
+      .filter((marker, index, all) => all.indexOf(marker) === index)
   }
 
   /** 发出去之后回填 Message-ID（回信的 References 里会带上它）。 */
@@ -249,17 +258,24 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
      */
     const wantUnseenOnly = config.reply?.unseenOnly !== false
     const passes = wantUnseenOnly ? [true, false] : [false]
+    // 我们已知的完整标记：交给 fetchReplies 做服务端精确定位。
+    // 这是「邮箱一大就漏掉新回复」那个 bug 的根本解法 ——
+    // 不再依赖"最近 N 封里应该能找到"这种会过期的假设。
+    const markers = knownMarkers()
     let found = []
     for (const unseenOnly of passes) {
       try {
         const batch = await fetchMails({
           ...options,
           marker: searchTerm,
+          markers,
           unseenOnly,
           // 163 等会把「自己回复自己」的邮件放进「已发送」，必须一起搜。
           autoDiscover: true,
-          // 前缀搜索会多捞一些，limit 放宽，靠 token 精确筛。
-          limit: 20,
+          // limit 只限制**返回条数**（现在是最新的 N 封），
+          // 真正的候选范围由 window 决定；前缀搜索必然多捞，靠 token 精确筛。
+          limit: 30,
+          window: 400,
         })
         found = found.concat(batch)
         // 未读那轮已经捞到东西就不必全量扫了（省一次 IMAP 往返）

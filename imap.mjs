@@ -398,6 +398,50 @@ export function extractMessageText(raw) {
 }
 
 /**
+ * 决定「这一轮到底按什么顺序去拉哪些 UID」—— 纯函数，便于回归测试。
+ *
+ * 规则（对应 2026-09-23 那个「邮件批准一直没反应」的 bug）：
+ *   1. 服务端精确定位到的 UID（`preciseUids`）排最前：它们是最可能包含
+ *      我们那封回信的邮件，而且不受邮箱大小影响；
+ *   2. 其余候选按 **新 → 旧**（`allUids` 是升序 UID，取尾部再反转）；
+ *   3. 这里**不做任何条数截断** —— 截断只能发生在"返回结果"那一步
+ *      （见 fetchReplies 末尾的 slice）。在候选阶段截断正是原 bug：
+ *      旧邮件占满名额，新回复被无声丢弃。
+ *
+ * @param {object} options
+ * @param {string[]} options.allUids - 该文件夹全部 UID（升序）。
+ * @param {Iterable<string>} [options.preciseUids] - 精确命中的 UID。
+ * @param {number} options.scanWindow - 宽松兜底看最近多少封（成本控制靠它）。
+ * @returns {string[]} 要依次拉取的 UID 列表（完整、有序、不截断）。
+ */
+export function rankCandidateUids({ allUids, preciseUids, scanWindow }) {
+  const precise = []
+  const preciseSeen = new Set()
+  for (const uid of preciseUids ?? []) {
+    const value = String(uid ?? '')
+    if (!value || preciseSeen.has(value)) continue
+    preciseSeen.add(value)
+    precise.push(value)
+  }
+
+  const queue = []
+  const queued = new Set()
+  const add = (uid) => {
+    const value = String(uid ?? '')
+    if (!value || queued.has(value) || preciseSeen.has(value)) return
+    queued.add(value)
+    queue.push(value)
+  }
+  const list = Array.isArray(allUids) ? allUids : []
+  const window = Math.max(0, Math.floor(Number(scanWindow) || 0))
+  // 新 → 旧：尾部是最新的。
+  for (const uid of (window > 0 ? list.slice(-window) : list).slice().reverse()) add(uid)
+
+  // 精确命中优先，其余保持"新→旧"。
+  return [...precise, ...queue]
+}
+
+/**
  * 列出收件箱里主题包含某标记的邮件（默认只要未读）。
  * @param {object} options
  * @param {string} options.host - IMAP 主机。
@@ -406,8 +450,10 @@ export function extractMessageText(raw) {
  * @param {string} options.user - 登录账号。
  * @param {string} options.pass - 授权码。
  * @param {string} options.marker - 主题里要匹配的纯 ASCII 标记。
+ * @param {string[]} [options.markers] - 已知的**完整线程标记**列表，用于服务端精确定位。
  * @param {boolean} [options.unseenOnly] - 是否只找未读，默认 true。
- * @param {number} [options.limit] - 最多取几封，默认 10。
+ * @param {number} [options.limit] - 最多**返回**几封，默认 10。
+ * @param {number} [options.window] - 候选窗口（看最近的多少封），默认 max(limit*4, 40)。
  * @param {string} [options.mailbox] - 邮箱文件夹，默认 INBOX。
  * @param {number} [options.timeoutMs] - 超时，默认 20000。
  * @returns {Promise<Array<{uid: string, raw: string, subject: string, from: string, text: string}>>}
@@ -421,8 +467,10 @@ export async function fetchReplies(options) {
     user,
     pass,
     marker,
+    markers,
     unseenOnly = true,
     limit = 10,
+    window: windowSize,
     mailbox = 'INBOX',
     mailboxes,
     autoDiscover = false,
@@ -483,6 +531,36 @@ export async function fetchReplies(options) {
 
     const results = []
     const seen = new Set()
+
+    // ── 两套定位策略 ────────────────────────────────────────────────
+    //
+    // 踩过的坑（2026-09-23 实测，导致「邮件批准一直没反应」）：
+    // 原实现用 `allUids.slice(-max(limit*4, 40))` 取候选，且**从最旧往最新扫**、
+    // 扫满 `limit` 封就 break。用户每一封摘要邮件都会回一次，于是 20 个名额被
+    // 旧回信占满 —— 他最新那封审批回信排在候选之外，**永远轮不到**，
+    // 现象就是「我回了邮件批准，等了很久毫无反应」。
+    //
+    // 现在三重修正：
+    //   ① **从最新往回扫**（新回复优先，回复是实时的，旧的沉底无所谓）；
+    //   ② `limit` 只限制**返回条数**，扫到就继续找、不再因为满了而漏掉新邮件；
+    //   ③ 额外支持 `markers`（我们已知的完整线程标记）做**服务端精确定位**，
+    //      邮箱再大也能直接命中 —— 不依赖"最近 N 封"这种会过期的假设。
+    //
+    // 注意 ③ 是**增强**不是必需：163 对 MIME 编码主题的服务端搜索不可靠
+    // （见下方注释），所以它失败时自动退回 ①② 的宽松扫描。
+    const precisePattern = []
+    for (const value of Array.isArray(markers) ? markers : []) {
+      const cleaned = String(value ?? '').replace(/\s+/g, '')
+      if (cleaned && !precisePattern.includes(cleaned)) precisePattern.push(cleaned)
+      if (precisePattern.length >= 10) break
+    }
+
+    const scanWindow = Math.max(
+      Number.isFinite(windowSize) && windowSize > 0 ? Math.floor(windowSize) : 0,
+      limit * 4,
+      40,
+    )
+
     for (const target of targets) {
       const selected = await connection.run(`SELECT ${quoteString(target)}`)
       if (!selected.ok) {
@@ -494,33 +572,43 @@ export async function fetchReplies(options) {
       //
       // 为什么不用服务端 `UID SEARCH SUBJECT "..."`：163 对 MIME 编码过的主题
       // （`=?gb18030?B?...?=`）匹配不到——实测 `UID SEARCH ALL` 能列出 7 封，
-      // 而 `UID SEARCH SUBJECT "DSH-"` 返回空。服务端主题搜索不可靠，
-      // 所以这里拿回原始邮件自己比对（顺带把 flags 也取回来，
-      // 用本地判断未读，避免再依赖服务端 UNSEEN 的语义）。
+      // 而 `UID SEARCH SUBJECT "DSH-"` 返回空。所以宽松扫描要靠 `UID SEARCH ALL`
+      // 拿回来自己比对；而下面针对**完整标记**的精确搜索是对它的补充尝试。
       const search = await connection.run('UID SEARCH ALL')
       if (!search.ok) continue
       const uidLine = search.lines.find((line) => /^\*\s+SEARCH/i.test(line)) ?? ''
       const allUids = uidLine.replace(/^\*\s+SEARCH\s*/i, '').trim().split(/\s+/).filter(Boolean)
-      if (allUids.length === 0) continue
-      // 从最新的往回看，最多看这么多封（避免大邮箱每轮拉太多）
-      const candidates = allUids.slice(-Math.max(limit * 4, 40))
 
-      for (const uid of candidates) {
+      const preciseUids = new Set()
+      // ③ 精确：直接问服务器「哪些邮件的主题里有这一串」。
+      for (const label of precisePattern) {
+        const hit = await connection.run(`UID SEARCH SUBJECT ${quoteString(label)}`)
+        if (!hit.ok) continue
+        const line = hit.lines.find((l) => /^\*\s+SEARCH/i.test(l)) ?? ''
+        for (const uid of line.replace(/^\*\s+SEARCH\s*/i, '').trim().split(/\s+/).filter(Boolean)) {
+          preciseUids.add(uid)
+        }
+      }
+
+      // 精确命中在前，其余按"新→旧"兜底；不在这里截断。
+      const scanList = rankCandidateUids({ allUids, preciseUids, scanWindow })
+
+      for (const uid of scanList) {
         const key = `${target}:${uid}`
         if (seen.has(key)) continue
         seen.add(key)
 
         let rawBytes = null
         let flags = ''
-        const fetched = await connection.run(`UID FETCH ${uid} (FLAGS BODY.PEEK[])`, {
+        const fetchedMail = await connection.run(`UID FETCH ${uid} (FLAGS BODY.PEEK[])`, {
           onLiteral: (line, data) => {
             // **保留原始字节**：正文可能是 GBK 等非 UTF-8 编码，
             // 这里若先 toString('utf8') 就把字节毁了，后面按 charset 解码也救不回来。
             if (/BODY\[/i.test(line)) rawBytes = data
           },
         })
-        if (!fetched.ok || !rawBytes) continue
-        const flagLine = fetched.lines.find((line) => /FLAGS/i.test(line)) ?? ''
+        if (!fetchedMail.ok || !rawBytes) continue
+        const flagLine = fetchedMail.lines.find((line) => /FLAGS/i.test(line)) ?? ''
         flags = flagLine
 
         // 本地判断未读（\Seen 是服务端权威标记）
@@ -539,11 +627,12 @@ export async function fetchReplies(options) {
           ...parsed,
           text: stripQuoted(parsed.text),
         })
-        if (results.length >= limit) break
       }
     }
     await connection.bye()
-    return results
+    // 只限制**返回条数**：调用方拿到的永远是"最新的 limit 封"，
+    // 不会因为旧邮件多就让新回复消失（那正是之前的 bug）。
+    return results.slice(-Math.max(limit, 1))
   } finally {
     connection.close()
   }

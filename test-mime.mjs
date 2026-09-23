@@ -8,7 +8,7 @@
  * 覆盖：multipart/alternative、base64 中文、quoted-printable 中文、
  * 只有 HTML 的回信、GBK 编码、引用剥离、以及和 reply.mjs 的联动。
  */
-import { decodeEncodedWords, extractMessageText, htmlToText, stripQuoted, subjectMatches } from './imap.mjs'
+import { decodeEncodedWords, extractMessageText, htmlToText, stripQuoted, subjectMatches, rankCandidateUids } from './imap.mjs'
 import { parseMailReply } from './reply.mjs'
 
 let failures = 0
@@ -241,6 +241,34 @@ console.log('\n[9] 本地主题匹配（不依赖服务端 SUBJECT 搜索）')
   check('不相关主题不匹配', subjectMatches('阿里云域名到期提醒', 'DSH-') === false)
   check('空 marker 视为全通过', subjectMatches('随便什么', '') === true)
   check('没标记的主题不匹配', subjectMatches('[DSH] 某个通知', 'DSH-Q:') === false)
+}
+
+console.log('\n[10] 候选 UID 排序与截断（回归：2026-09-23「邮件批准一直没反应」）')
+{
+  // 真实故障：收件箱里 30 封都是用户自己回的旧摘要邮件，他最新那封审批回信
+  // 排在候选之外；旧实现「从最旧往最新扫 + 扫满 limit 就 break」，
+  // 于是新回复永远轮不到 —— 他回邮件批准后等了很久毫无反应，最后只能去点界面拒绝。
+  const allUids = Array.from({ length: 30 }, (_, i) => String(1000 + i))
+
+  const ranked = rankCandidateUids({ allUids, preciseUids: [], scanWindow: 400 })
+  check('不截断：候选数与窗口一致', ranked.length === 30, ranked.length)
+  check('最新的排最前', ranked[0] === '1029', ranked[0])
+  check('最旧的排最后', ranked[ranked.length - 1] === '1000', ranked[ranked.length - 1])
+
+  // 关键断言：limit 再小，新邮件也必须在拉取列表里（截断只发生在返回阶段）。
+  const small = rankCandidateUids({ allUids, preciseUids: [], scanWindow: 8 })
+  check('窗口小也只丢旧的', small.length === 8 && small[0] === '1029', small.join(','))
+  check('旧 UID 不进入候选', !small.includes('1000'), small.join(','))
+
+  // 服务端精确定位到的 UID 必须排最前，哪怕它很旧、哪怕窗口根本不覆盖它。
+  const preciseHit = rankCandidateUids({ allUids, preciseUids: ['9999'], scanWindow: 5 })
+  check('精确命中排最前（即使超出窗口）', preciseHit[0] === '9999', preciseHit.join(','))
+  check('精确命中不重复出现', preciseHit.filter((u) => u === '9999').length === 1)
+
+  // 邮箱里有 200 封时，最新那封依然在候选首位 —— 大邮箱不漏。
+  const big = Array.from({ length: 200 }, (_, i) => String(1 + i))
+  const bigRanked = rankCandidateUids({ allUids: big, preciseUids: [], scanWindow: 400 })
+  check('大邮箱不丢最新', bigRanked[0] === '200', bigRanked[0])
 }
 
 console.log(`\n${failures === 0 ? '全部通过' : '有失败项'}：${checks - failures}/${checks}\n`)
