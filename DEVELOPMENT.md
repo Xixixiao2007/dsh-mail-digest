@@ -160,3 +160,21 @@ skill 是另一套东西、装在 `~/.dsh/skills/`，给 **agent** 看的操作�
 规则的**内容**单一来源是 `AGENTS.dsh-mail-digest.md`（带标记的模板）；
 仓库根的 `AGENTS.md` 是同一套规则的人读版（面向"改这个仓库"的场景）。
 
+### 给别人复用：tools/AgentRules.ps1
+
+上面那些坑（数组、`(?s)`、BOM、幂等、托管区块）是**任何**想做同样事情的插件都会遇到的，
+所以实现抽成了通用模块 `tools/AgentRules.ps1`，不绑定本插件：
+
+```powershell
+. "$PSScriptRoot\tools\AgentRules.ps1"
+Install-AgentRules   -DshHome $dshHome -TemplatePath "$PSScriptRoot\AGENTS.myplugin.md" `
+                     -BlockName 'my-plugin' -Manager 'install.ps1'
+Uninstall-AgentRules -DshHome $dshHome -BlockName 'my-plugin' -Manager 'install.ps1'
+```
+
+- `-Manager`（写进标记的安装脚本名）**一旦发布就不要改** —— 改了等于换一套标记，
+  旧用户那里的区块会认不出来，于是又追加一块。
+- 模板可以自带成对标记（推荐，便于人读）；没有标记时模块会自动补。
+- 回归测试见 `test-installer.ps1`（8 项，含"裸模板自动补标记"）。
+
+

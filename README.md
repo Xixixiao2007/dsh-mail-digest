@@ -170,6 +170,11 @@ http://127.0.0.1:3080/dsh-mail-digest
 - 不想让 agent 收到这些规则：跑 `-Uninstall`，或手动删 `~/.dsh/AGENTS.md` 里
   `<!-- BEGIN dsh-mail-digest -->` 到 `<!-- END dsh-mail-digest -->` 之间的内容
 
+> **给其它插件作者**：这套"把规则写进用户全局指令"的机制是通用逻辑，已抽成可复用模块
+> [`tools/AgentRules.ps1`](./tools/AgentRules.ps1)——dot-source 后调用
+> `Install-AgentRules` / `Uninstall-AgentRules` 即可，自带幂等替换、保留用户已有内容、
+> 干净卸载、不带 BOM。用法与踩过的坑都写在那个文件的头部注释里。
+
 ## 安全说明
 
 ### 为什么不会被随机邮件骗到

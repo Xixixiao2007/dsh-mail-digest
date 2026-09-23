@@ -30,7 +30,8 @@
     "DEVELOPMENT.md",
     "AGENTS.md",
     "AGENTS.dsh-mail-digest.md",
-    "test-installer.ps1"
+    "test-installer.ps1",
+    "tools/AgentRules.ps1"
   ],
   "keywords": [
     "dsh-plugin",
