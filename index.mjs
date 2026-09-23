@@ -28,6 +28,7 @@ import { blocksToText, cleanAnswerText, extractiveDigest, isAssistantTextEvent, 
 import { testImap } from './imap.mjs'
 import { createReplyBridge, imapOptions, imapReady, POLL_INTERVAL_MS } from './qa.mjs'
 import { newThreadToken, threadMarker } from './reply.mjs'
+import { loadPending, renderPendingBlock, savePending } from './pending.mjs'
 import { registerSettingsRoutes } from './settings.mjs'
 import { sendMail } from './smtp.mjs'
 import { modelDigest } from './summary.mjs'
@@ -237,11 +238,21 @@ export function apply(ctx) {
     return null
   }
 
-  /** 组装邮件正文。摘要是主角，其余是定位用的几行。 */
+  /**
+   * 组装邮件正文。摘要是主角，其余是定位用的几行。
+   *
+   * 结构：摘要 → ⚠待批准权限（若空则不占位）→ 元信息 → 回信提示。
+   * 待办块放前面是因为它需要用户动手，但又不该盖住摘要本身。
+   */
   function composeMail({ title, cwd, turn, durationMs, outcome, digest, note, replyHint }) {
+    const pendingBlock = renderPendingBlock(loadPending())
     const lines = []
     if (digest) lines.push(digest)
     else lines.push(NO_ANSWER_NOTICE)
+    if (pendingBlock) {
+      lines.push('')
+      lines.push(pendingBlock.trim())
+    }
     lines.push('')
     lines.push('────────────')
     lines.push(`会话：${title || '（未命名会话）'}`)
@@ -268,7 +279,10 @@ export function apply(ctx) {
     const prefix = config.subjectPrefix ? `${config.subjectPrefix} ` : ''
     const name = title || '（未命名会话）'
     const tag = marker ? ` ${marker}` : ''
-    return `${prefix}${mark} ${name}${tag}`
+    // 有待批准权限时在主题上标出来，手机上不用点开就能看见
+    const pendingCount = loadPending().length
+    const warn = pendingCount > 0 ? ` ⚠${pendingCount}项待批准` : ''
+    return `${prefix}${mark} ${name}${warn}${tag}`
   }
 
   /**
@@ -488,6 +502,23 @@ export function apply(ctx) {
         required: true,
         description: '要发进邮件的中文摘要，一段连续文本，详略由结论多少决定。',
       },
+      pendingPermissions: {
+        type: 'array',
+        description:
+          '需要用户批准的权限/操作清单，会以独立区块显示在邮件里（每次发信都带上）。'
+          + '用法：把你因为「需要提权才能做」而**暂时没做**的事记在这里；'
+          + '用户批准并做完之后，用空数组 [] 清空。'
+          + '只写真的需要用户放行的事（通常是要写工作区之外的路径）。',
+        items: {
+          type: 'object',
+          properties: {
+            what: { type: 'string', required: true, description: '要做什么（一句话）' },
+            why: { type: 'string', description: '为什么需要它' },
+            need: { type: 'string', description: '需要什么权限，例如：写 ~/.dsh/skills' },
+          },
+          additionalProperties: false,
+        },
+      },
     },
     // output.schema 同样是作者侧 DSL：required 是属性上的标记，不是顶层数组。
     output: {
@@ -496,6 +527,7 @@ export function apply(ctx) {
         properties: {
           accepted: { type: 'boolean', required: true },
           turn: { type: 'integer' },
+          pendingCount: { type: 'integer' },
         },
         additionalProperties: false,
       },
@@ -503,12 +535,23 @@ export function apply(ctx) {
         type: 'text',
         text: value?.accepted
           ? `已把这条摘要排进第 ${value.turn} 轮的邮件。`
+            + (typeof value.pendingCount === 'number'
+              ? `待批准权限清单现有 ${value.pendingCount} 项。`
+              : '')
           : '这一轮已经发过信了，摘要没有采用。',
       }],
     },
     execute: (args, exec) => {
       const session = exec.agent?.session
-      if (!session) return { accepted: false, turn: 0 }
+      // 待批准清单与摘要相互独立：即使这一轮不采用摘要，也要能把清单记下来。
+      let pendingCount = loadPending().length
+      if (Array.isArray(args.pendingPermissions)) {
+        const saved = savePending(args.pendingPermissions)
+        pendingCount = saved.count
+        if (saved.ok) log('info', `待批准权限清单更新为 ${saved.count} 项（${saved.path}）`)
+        else log('warn', `待批准权限清单写入失败：${saved.error}`)
+      }
+      if (!session) return { accepted: false, turn: 0, pendingCount }
       // 找这一会话里最后一轮还没发信的状态。先快照：迭代期间别的路径会改动这个 Map。
       let target = null
       for (const [key, state] of [...turns.entries()]) {
@@ -516,10 +559,10 @@ export function apply(ctx) {
         if (state.ended) continue
         if (!target || state.turn > target.turn) target = state
       }
-      if (!target) return { accepted: false, turn: 0 }
+      if (!target) return { accepted: false, turn: 0, pendingCount }
       target.explicit = String(args.summary ?? '')
       log('info', `已收到第 ${target.turn} 轮的自写摘要`)
-      return { accepted: true, turn: target.turn }
+      return { accepted: true, turn: target.turn, pendingCount }
     },
   })), 'dsh-mail-digest: mail_digest tool')
 

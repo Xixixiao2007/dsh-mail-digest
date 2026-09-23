@@ -23,6 +23,7 @@ const { defineTool } = await import('@deepseek-ai/dsh-tools')
 const plugin = await import('./index.mjs')
 const { cleanAnswerText, extractiveDigest, normalizeDigest, blocksToText } = await import('./digest.mjs')
 const { loadConfig, saveConfig, describeReadiness, publicConfig, configPath, providerChoices } = await import('./config.mjs')
+const { loadPending, renderPendingBlock, savePending, pendingPath } = await import('./pending.mjs')
 
 let failures = 0
 let checks = 0
@@ -252,6 +253,85 @@ if (typeof handler === 'function') {
 }
 
 rmSync(HOME, { recursive: true, force: true })
+
+console.log('\n[7] 待批准权限清单')
+{
+  // 干净起点
+  savePending([])
+  check('初始为空', loadPending().length === 0, JSON.stringify(loadPending()))
+  check('为空时不占邮件版面', renderPendingBlock([]) === '', JSON.stringify(renderPendingBlock([])))
+
+  const saved = savePending([
+    { what: '把三条坑写进 dsh-plugin-mgmt 技能', why: '下次发布插件还会踩', need: '写 ~/.dsh/skills' },
+    { what: '更新 profile 的 cordis.patch.yml', need: '写 ~/.dsh/profiles/web' },
+  ])
+  check('保存成功', saved.ok === true && saved.count === 2, JSON.stringify(saved))
+  check('落盘了', loadPending().length === 2, JSON.stringify(loadPending().map((i) => i.what)))
+
+  const block = renderPendingBlock(loadPending())
+  check('渲染出区块标题', block.includes('待你批准的权限'), block.slice(0, 60))
+  check('渲染出条目标题', block.includes('把三条坑写进'), block)
+  check('渲染出需要什么权限', block.includes('需要：写 ~/.dsh/skills'), block)
+  check('渲染出原因', block.includes('原因：下次发布插件还会踩'), block)
+  check('缺 why 的那条不报错', block.includes('更新 profile'), block)
+  check('区块以空行开头（与摘要隔开）', block.startsWith('\n'), JSON.stringify(block.slice(0, 6)))
+
+  // 清空语义：空数组 = 清空
+  const cleared = savePending([])
+  check('空数组清空清单', cleared.count === 0 && loadPending().length === 0, JSON.stringify(cleared))
+
+  // 脏数据要能被规整掉，而不是让邮件崩
+  const messy = savePending([
+    '纯字符串也算一条',
+    { why: '没有 what 应被丢弃' },
+    null,
+    { what: 'A'.repeat(500), need: 'B'.repeat(500) },
+  ])
+  const items = loadPending()
+  check('脏数据被规整', items.length === 2, JSON.stringify(items.map((i) => i.what.slice(0, 12))))
+  check('超长文本被截断', items[1].what.length <= 300 && items[1].need.length <= 300,
+    `${items[1].what.length}/${items[1].need.length}`)
+  check('规整后仍能渲染', renderPendingBlock(items).includes('纯字符串也算一条'))
+  savePending([])
+
+  check('清单路径与配置同目录', pendingPath().includes('dsh-mail-digest'), pendingPath())
+}
+
+console.log('\n[8] mail_digest 工具带待批准权限参数')
+{
+  const definition = registered.find((d) => d.name === 'mail_digest')
+  check('工具已注册', Boolean(definition))
+  // 注意：这里拿到的是 defineTool **编译后**的 JSON Schema，
+  // 自定义属性在 .properties 下（不是 DSL 那种平铺结构）。
+  const props = definition?.parameters?.properties ?? {}
+  check('参数里有 pendingPermissions', Boolean(props.pendingPermissions),
+    JSON.stringify(Object.keys(props)))
+  check('pendingPermissions 声明为数组', props.pendingPermissions?.type === 'array',
+    JSON.stringify(props.pendingPermissions?.type))
+  check('它的元素是对象（含 what）',
+    props.pendingPermissions?.items?.properties?.what?.type === 'string',
+    JSON.stringify(props.pendingPermissions?.items))
+
+  // 通过工具写清单，再通过工具清空
+  const exec = { agent: undefined }
+  const saved = await definition.execute({
+    summary: 'x',
+    pendingPermissions: [{ what: '通过工具写入的待办', need: '写某处' }],
+  }, exec)
+  check('工具能写入清单', loadPending().length === 1, JSON.stringify(loadPending()))
+  check('返回里带 pendingCount', saved?.pendingCount === 1, JSON.stringify(saved))
+
+  const cleared = await definition.execute({ summary: 'x', pendingPermissions: [] }, exec)
+  check('工具能用空数组清空', loadPending().length === 0, JSON.stringify(loadPending()))
+  check('清空后 pendingCount 为 0', cleared?.pendingCount === 0, JSON.stringify(cleared))
+
+  // 不传这个参数时不应改动既有清单
+  savePending([{ what: '既有项' }])
+  await definition.execute({ summary: 'x' }, exec)
+  check('不传参数不动清单', loadPending().length === 1 && loadPending()[0].what === '既有项',
+    JSON.stringify(loadPending()))
+  savePending([])
+}
 
 console.log(`\n${failures === 0 ? '全部通过' : '有失败项'}：${checks - failures}/${checks}\n`)
 process.exit(failures === 0 ? 0 : 1)
