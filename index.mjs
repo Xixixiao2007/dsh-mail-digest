@@ -46,6 +46,92 @@ export const inject = ['tools', 'agents', 'llm']
 /** 一轮压不出来时的兜底上限保护：这是安全线，不是详略控制。 */
 const NO_ANSWER_NOTICE = '（这一轮没有产生文本回答）'
 
+/**
+ * 界面先给出非「允许」结论后，还给邮件多久的翻盘窗口。
+ *
+ * 为什么需要：界面点一下是**瞬间**的，邮件往返要几十秒，`Promise.race` 里邮件几乎必输。
+ * 实测（2026-09-23 14:21）：用户收到审批邮件 17 秒后就回信批准了，却因为界面同时
+ * 返回 rejected，工具当场失败 —— 他的邮件批准完全没有机会生效。
+ *
+ * 取值权衡：太短则邮件来不及（IMAP 轮询间隔 5 秒 + 投递延迟），太长则人在电脑前
+ * 点拒绝后要干等。45 秒覆盖正常投递，同时不至于让人等太久。
+ */
+const APPROVAL_MAIL_GRACE_MS = 45_000
+
+/**
+ * 仲裁「界面结论」与「邮件结论」—— 纯函数，便于直接测试。
+ *
+ * 规则：
+ *   1. 邮件先给出结论 → 以邮件为准（`allowed-once` / `rejected`）；
+ *   2. 界面先到且是 `allowed-once` → 直接采纳（放行只会更宽松，没有安全代价，不必等）；
+ *   3. 界面先到且是别的结论 → **不立刻定论**：给邮件一个宽限期，
+ *      期间邮件批准了就以邮件为准；宽限期内没有邮件结论，才按界面结论走（fail closed）。
+ *
+ * 之所以必须有第 3 条：界面点一下是瞬间的，邮件往返几十秒，纯 `race` 里邮件几乎必输。
+ * 实测 2026-09-23 14:21 —— 用户收到审批邮件 17 秒后就回信批准，却因界面同时返回
+ * rejected 而当场失败，他的批准完全没机会生效。
+ *
+ * @param {object} deps
+ * @param {Promise<object>} deps.byMail - 邮件通道结论 promise。
+ * @param {Promise<string>} deps.byInterface - 界面通道结论 promise。
+ * @param {number} [deps.graceMs] - 宽限期毫秒数。
+ * @param {(level: string, message: string) => void} [deps.log] - 日志。
+ * @returns {Promise<string>} ApprovalOutcome。
+ */
+export async function arbitrateApproval({ byMail, byInterface, graceMs = 0, log = () => {} }) {
+  const viaMail = (answer) => {
+    const decision = answer?.decision
+    if (decision === 'allow') return 'allowed-once'
+    if (decision === 'reject') return 'rejected'
+    return null
+  }
+
+  const first = await Promise.race([
+    byMail.then((answer) => ({ viaMail: true, answer })),
+    byInterface.then((outcome) => ({ viaMail: false, outcome })),
+  ])
+
+  if (first.viaMail) {
+    const decided = viaMail(first.answer)
+    if (decided) return decided
+    // 邮件未决（被撤销等）：交回界面。
+    return byInterface
+  }
+
+  if (first.outcome === 'allowed-once') return 'allowed-once'
+
+  const wait = Math.max(0, Number(graceMs) || 0)
+  if (wait === 0) return first.outcome
+
+  log('info', `界面先给了「${first.outcome}」，但邮件通道还在等 —— 给它 ${Math.round(wait / 1000)} 秒宽限`)
+  const grace = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), wait)
+    timer.unref?.()
+    byMail.then((answer) => {
+      clearTimeout(timer)
+      resolve({ answer })
+    }, () => {
+      clearTimeout(timer)
+      resolve(null)
+    })
+  })
+
+  if (grace) {
+    const decided = viaMail(grace.answer)
+    if (decided === 'allowed-once') {
+      log('info', `宽限期内收到邮件批准，以邮件为准（界面那时说的是「${first.outcome}」）`)
+      return 'allowed-once'
+    }
+    if (decided === 'rejected') {
+      log('info', '宽限期内收到邮件拒绝，以邮件为准')
+      return 'rejected'
+    }
+  }
+
+  log('info', `界面给出了审批结论（${first.outcome}），宽限期内没有邮件结论，按界面为准`)
+  return first.outcome
+}
+
 /** 可读时间戳：本机时区，秒级。 */
 function stamp(date = new Date()) {
   const pad = (n) => String(n).padStart(2, '0')
@@ -818,37 +904,29 @@ export function apply(ctx) {
         }
         replyBridge.noteSent(token, sent.messageId)
         log('info', `已把审批请求发到邮箱（${marker}，工具 ${request?.toolName || '?'}），等回信或界面决定`)
+        // 立刻补一次收信：定时收信最长要等 APPROVAL_POLL_MS，而实测用户 17 秒
+        // 就回信了 —— 这十几秒的等待正是「我给批了它却没反应」的一部分。
+        // fire-and-forget：不阻塞审批流程，pollOnce 自带在途去重。
+        void replyBridge.pollOnce({}).catch((error) => {
+          log('warn', `审批期主动收信失败：${error.message}`)
+        })
       } catch (error) {
         log('warn', `审批邮件发送失败：${error.message}`)
         replyBridge.finish(token)
         return byInterface
       }
 
-      const byMail = decisionPromise.then((answer) => ({ viaMail: true, answer }))
-      const first = await Promise.race([
-        byMail,
-        byInterface.then((outcome) => ({ viaMail: false, outcome })),
-      ])
-
-      if (first.viaMail) {
-        const decision = first.answer?.decision
-        if (decision === 'allow') {
-          log('info', `邮件批准了这次操作（${marker}）—— 界面若还开着可以取消`)
-          return 'allowed-once'
-        }
-        if (decision === 'reject') {
-          log('info', `邮件拒绝了这次操作（${marker}）${first.answer?.timeout ? '（超时默认拒绝）' : ''}`)
-          return 'rejected'
-        }
-        // 撤销/未决：交回界面
-        log('info', `邮件审批未决（${marker}），交回界面`)
-        return byInterface
-      }
-
-      // 界面先到：撤销邮件通道，别让它之后再来改结论。
+      // 仲裁：邮件批准优先于界面拒绝（见 arbitrateApproval 的说明）。
+      const outcome = await arbitrateApproval({
+        byMail: decisionPromise,
+        byInterface,
+        graceMs: APPROVAL_MAIL_GRACE_MS,
+        log,
+      })
+      // 定论之后撤销邮件线程，别让它之后再来改结论。
       replyBridge.finish(token)
-      log('info', `界面先给出了审批结论（${first.outcome}）`)
-      return first.outcome
+      log('info', `这次审批以「${outcome}」结束（${marker}）`)
+      return outcome
     })()
   })
 

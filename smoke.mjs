@@ -339,5 +339,73 @@ console.log('\n[8] mail_digest 工具带待批准权限参数')
   savePending([])
 }
 
+console.log('\n[10] 审批仲裁（回归：2026-09-23 14:21「邮件批准了却没生效」）')
+{
+  // 实测故障：用户 14:21:02 收到审批邮件、14:21:19 回信批准，
+  // 但界面同时在 14:21:2x 返回 rejected，纯 race 让界面瞬间取胜 ——
+  // 用户的邮件批准完全没机会生效，他只能看着"没反应"。
+  const { arbitrateApproval } = plugin
+  check('导出了 arbitrateApproval', typeof arbitrateApproval === 'function')
+
+  const settle = (ms, value) => new Promise((resolve) => setTimeout(() => resolve(value), ms))
+  const logs = []
+  const log = (level, message) => logs.push(message)
+
+  // ① 邮件先到 → 以邮件为准
+  check('邮件先批准 → allowed-once', await arbitrateApproval({
+    byMail: settle(0, { decision: 'allow' }),
+    byInterface: settle(500, 'rejected'),
+    graceMs: 50, log,
+  }) === 'allowed-once')
+
+  check('邮件先拒绝 → rejected', await arbitrateApproval({
+    byMail: settle(0, { decision: 'reject' }),
+    byInterface: settle(500, 'allowed-once'),
+    graceMs: 50, log,
+  }) === 'rejected')
+
+  // ② 界面批准 → 立刻采纳，不必等宽限期（放行更宽松，没有安全代价）
+  const startedAt = Date.now()
+  const fast = await arbitrateApproval({
+    byMail: settle(5000, { decision: 'allow' }),
+    byInterface: settle(0, 'allowed-once'),
+    graceMs: 5000, log,
+  })
+  check('界面批准立刻生效（不等宽限期）', fast === 'allowed-once' && Date.now() - startedAt < 1000,
+    `${fast} / ${Date.now() - startedAt}ms`)
+
+  // ③ ★ 核心回归：界面拒绝先到，但邮件在宽限期内批准 → 必须采纳邮件
+  logs.length = 0
+  const rescued = await arbitrateApproval({
+    byMail: settle(40, { decision: 'allow' }),
+    byInterface: settle(0, 'rejected'),
+    graceMs: 3000, log,
+  })
+  check('★ 界面拒绝先到，邮件在宽限期内批准 → 采纳邮件', rescued === 'allowed-once', rescued)
+  check('日志说明了是宽限期救回来的', logs.some((m) => m.includes('宽限期')), JSON.stringify(logs))
+
+  // ④ 界面拒绝 + 宽限期内邮件没动静 → 按界面结论（fail closed）
+  const closed = await arbitrateApproval({
+    byMail: settle(5000, { decision: 'allow' }),
+    byInterface: settle(0, 'rejected'),
+    graceMs: 120, log,
+  })
+  check('宽限期内无邮件结论 → 按界面拒绝（fail closed）', closed === 'rejected', closed)
+
+  // ⑤ 宽限期内邮件也拒绝 → rejected（不会因为"等到了"就放行）
+  check('宽限期内邮件拒绝 → rejected', await arbitrateApproval({
+    byMail: settle(30, { decision: 'reject' }),
+    byInterface: settle(0, 'rejected'),
+    graceMs: 3000, log,
+  }) === 'rejected')
+
+  // ⑥ 宽限期为 0 时保持旧行为（界面结论立刻生效）
+  check('graceMs=0 时不等（兼容行为）', await arbitrateApproval({
+    byMail: settle(5000, { decision: 'allow' }),
+    byInterface: settle(0, 'rejected'),
+    graceMs: 0, log,
+  }) === 'rejected')
+}
+
 console.log(`\n${failures === 0 ? '全部通过' : '有失败项'}：${checks - failures}/${checks}\n`)
 process.exit(failures === 0 ? 0 : 1)

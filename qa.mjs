@@ -115,6 +115,8 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
   const threads = new Map()
   /** 已经用掉的邮件 uid（避免重复采纳同一封回信）。 */
   const consumedUids = new Set()
+  /** 是否有一次收信正在进行中（定时收信与审批期主动补查可能撞上）。 */
+  let pollInFlight = false
 
   /** 每封邮件都换一个标记：先注册，发完把 messageId 回填。 */
   function register(thread) {
@@ -212,10 +214,24 @@ export function createReplyBridge({ getConfig, log, allowedSenders, fetchReplies
 
   /**
    * 轮询一次收件箱，把回信变成答案 / 新消息。
+   *
+   * 同一时刻只允许一个在途轮询：定时收信与「审批宽限期内的主动补查」可能撞上，
+   * 并发收信既浪费 IMAP 往返，也可能让同一封邮件被两条路径同时处理。
+   *
    * @param {object} handlers
    * @param {(payload: {token: string, sessionId: string, text: string, mail: object}) => void} [handlers.onConversationReply]
    */
   async function pollOnce({ onConversationReply } = {}) {
+    if (pollInFlight) return
+    pollInFlight = true
+    try {
+      await pollOnceInner({ onConversationReply })
+    } finally {
+      pollInFlight = false
+    }
+  }
+
+  async function pollOnceInner({ onConversationReply } = {}) {
     const config = getConfig()
     if (!config.enabled || !config.reply?.enabled) return
     if (!imapReady(config)) return
