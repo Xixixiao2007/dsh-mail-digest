@@ -8,7 +8,7 @@
  * 覆盖：multipart/alternative、base64 中文、quoted-printable 中文、
  * 只有 HTML 的回信、GBK 编码、引用剥离、以及和 reply.mjs 的联动。
  */
-import { decodeEncodedWords, extractMessageText, htmlToText, stripQuoted, subjectMatches, rankCandidateUids } from './imap.mjs'
+import { decodeEncodedWords, extractMessageText, htmlToText, stripQuoted, subjectMatches, rankCandidateUids, pickNewestMails } from './imap.mjs'
 import { parseMailReply } from './reply.mjs'
 
 let failures = 0
@@ -269,6 +269,38 @@ console.log('\n[10] 候选 UID 排序与截断（回归：2026-09-23「邮件批
   const big = Array.from({ length: 200 }, (_, i) => String(1 + i))
   const bigRanked = rankCandidateUids({ allUids: big, preciseUids: [], scanWindow: 400 })
   check('大邮箱不丢最新', bigRanked[0] === '200', bigRanked[0])
+}
+
+console.log('\n[11] 取「最新 limit 封」（回归：2026-09-23 用户回信被切掉）')
+{
+  // 真实故障：结果池的顺序是**扫描顺序（新→旧）**，而收尾写了 `results.slice(-limit)`
+  // —— 它取的是池子**末尾** limit 封，也就是最旧的那批，把用户刚回的审批回信
+  // 干脆利落地切掉了。现象是"我明明回了邮件，它毫无反应"，且日志里什么都看不到。
+  const mk = (uid, mailbox = 'INBOX') => ({ uid: `${mailbox}:${uid}`, mailbox, subject: `s${uid}` })
+
+  const pool = [402, 401, 400, 399, 398, 397].map((u) => mk(u))
+  const picked = pickNewestMails({ results: pool, folderOrder: ['INBOX'], limit: 3 })
+  const uids = picked.map((m) => m.uid)
+  check('★ 取到的是最新 3 封（不是最旧 3 封）', uids.join(',') === 'INBOX:402,INBOX:401,INBOX:400', uids.join(','))
+  check('不会切掉刚到的回信', uids.includes('INBOX:402'), uids.join(','))
+
+  const shuffled = [mk(398), mk(402), mk(400)]
+  check('池子乱序时仍按 UID 取最新', pickNewestMails({ results: shuffled, folderOrder: ['INBOX'], limit: 1 })[0].uid === 'INBOX:402')
+
+  check('limit 超过池子大小时全返回', pickNewestMails({ results: pool, folderOrder: ['INBOX'], limit: 99 }).length === 6)
+  check('全返回时也是新在前', pickNewestMails({ results: pool, folderOrder: ['INBOX'], limit: 99 })[0].uid === 'INBOX:402')
+
+  const messy = [mk(402), { uid: undefined, mailbox: 'INBOX' }, mk(400, '已发送')]
+  const messyPicked = pickNewestMails({ results: messy, folderOrder: ['INBOX', '已发送'], limit: 3 })
+  check('uid 异常不抛错', messyPicked.length === 3, String(messyPicked.length))
+  check('数值 UID 排在异常 UID 之前', String(messyPicked[0].uid).includes('402'), String(messyPicked[0].uid))
+
+  const twoFolders = [mk(5, '已发送'), mk(9, 'INBOX')]
+  check('INBOX 结果优先于已发送', pickNewestMails({ results: twoFolders, folderOrder: ['INBOX', '已发送'], limit: 2 })[0].uid === 'INBOX:9')
+
+  // 防「...parsed 展开在 uid 之后把 uid 覆盖掉」那个 bug 复发
+  const result = { ...{ subject: 'x', text: 'y' }, uid: 'INBOX:1', mailbox: 'INBOX' }
+  check('结果对象保留 uid（防展开顺序写错）', result.uid === 'INBOX:1')
 }
 
 console.log(`\n${failures === 0 ? '全部通过' : '有失败项'}：${checks - failures}/${checks}\n`)

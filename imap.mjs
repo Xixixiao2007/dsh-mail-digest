@@ -531,6 +531,8 @@ export async function fetchReplies(options) {
 
     const results = []
     const seen = new Set()
+    /** 解析失败的邮件（只记不影响其他邮件）。 */
+    const parseFailures = []
 
     // ── 两套定位策略 ────────────────────────────────────────────────
     //
@@ -597,6 +599,9 @@ export async function fetchReplies(options) {
         const key = `${target}:${uid}`
         if (seen.has(key)) continue
         seen.add(key)
+        if (process.env.DSH_MAIL_DEBUG && /^\d+$/.test(String(uid)) && String(uid).endsWith('402')) {
+          console.error(`[dbg] >>> 开始处理 uid=${uid}`)
+        }
 
         let rawBytes = null
         let flags = ''
@@ -607,35 +612,92 @@ export async function fetchReplies(options) {
             if (/BODY\[/i.test(line)) rawBytes = data
           },
         })
-        if (!fetchedMail.ok || !rawBytes) continue
+        if (!fetchedMail.ok || !rawBytes) {
+          if (process.env.DSH_MAIL_DEBUG) console.error(`[dbg] FETCH 失败 uid=${uid}`)
+          continue
+        }
         const flagLine = fetchedMail.lines.find((line) => /FLAGS/i.test(line)) ?? ''
         flags = flagLine
 
         // 本地判断未读（\Seen 是服务端权威标记）
         if (unseenOnly && /\\Seen/i.test(flags)) continue
 
-        const parsed = extractMessageText(rawBytes)
+        const parsed = (() => {
+          try {
+            return extractMessageText(rawBytes)
+          } catch (error) {
+            // 一封解析不了不该拖垮整批（抛错发生在循环里会让后面的邮件全没了）。
+            parseFailures.push({ uid, message: error.message })
+            return null
+          }
+        })()
+        if (!parsed) continue
         // 本地匹配主题标记
         if (marker && !subjectMatches(parsed.subject, marker)) continue
 
         results.push({
+          // ⚠ 顺序要紧：`...parsed` 必须展开在最前。
+          // 踩过的坑（2026-09-23）：原先写成 `uid: key` 在前、`...parsed` 在后，
+          // 而 parsed 里**没有** uid 键，展开后把 uid 覆盖成了 undefined ——
+          // 于是每封邮件的 uid 都是 undefined，去重和排序全部失效，
+          // 而诊断脚本按 uid 排序时看起来像"最新的没取到"，极易误导。
+          ...parsed,
           uid: key,
           mailbox: target,
           // 给人看的文本（UTF-8 近似）与用于解码的字节都留着
           raw: rawBytes.toString('utf8'),
           rawBytes,
-          ...parsed,
           text: stripQuoted(parsed.text),
         })
       }
     }
     await connection.bye()
-    // 只限制**返回条数**：调用方拿到的永远是"最新的 limit 封"，
-    // 不会因为旧邮件多就让新回复消失（那正是之前的 bug）。
-    return results.slice(-Math.max(limit, 1))
+    if (process.env.DSH_MAIL_DEBUG && parseFailures.length) {
+      console.error(`[dbg] 解析失败 ${parseFailures.length} 封：${parseFailures.map((f) => `${f.uid}(${f.message})`).join('; ')}`)
+    }
+    // 只限制**返回条数**，并且必须是"最新"的那批（见 pickNewestMails 的说明）。
+    return pickNewestMails({ results, folderOrder: targets, limit })
   } finally {
     connection.close()
   }
+}
+
+/**
+ * 从结果池里挑出「最新的 limit 封」—— 纯函数，便于回归测试。
+ *
+ * 为什么必须有这个函数（2026-09-23，这个坑连害两轮）：
+ * 结果池的**顺序是扫描顺序（新→旧）**，所以「取池子末尾 limit 封」拿到的是
+ * **最旧的**那批，会把用户刚回的邮件干脆利落地切掉。必须按 UID 明确排序：
+ * UID 在单个文件夹内单调递增，取 UID 最大的 limit 个才是真正的最新。
+ *
+ * 排序规则：先按文件夹（保持传入的 folderOrder，INBOX 优先），同文件夹内
+ * 按 UID 数值降序；UID 解析不出来的排在后面。
+ *
+ * @param {object} options
+ * @param {Array<object>} options.results - 结果池。
+ * @param {string[]} [options.folderOrder] - 文件夹优先级（越靠前越优先）。
+ * @param {number} options.limit - 最多返回几封。
+ * @returns {Array<object>} 最新的 limit 封。
+ */
+export function pickNewestMails({ results, folderOrder = [], limit = 10 }) {
+  const list = Array.isArray(results) ? results : []
+  const order = Array.isArray(folderOrder) ? folderOrder : []
+  const rankOf = (mailbox) => {
+    const index = order.indexOf(mailbox)
+    return index === -1 ? order.length : index
+  }
+  const numericOf = (mail) => Number(String(mail?.uid ?? '').replace(/^.*:/, ''))
+
+  const decorated = list.map((mail, index) => ({ mail, index, rank: rankOf(mail?.mailbox), numeric: numericOf(mail) }))
+  decorated.sort((a, b) => {
+    if (a.rank !== b.rank) return a.rank - b.rank
+    const aOk = Number.isFinite(a.numeric)
+    const bOk = Number.isFinite(b.numeric)
+    if (aOk && bOk && a.numeric !== b.numeric) return b.numeric - a.numeric
+    if (aOk !== bOk) return aOk ? -1 : 1
+    return a.index - b.index
+  })
+  return decorated.slice(0, Math.max(Math.floor(Number(limit) || 0), 1)).map((entry) => entry.mail)
 }
 
 /**
