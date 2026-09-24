@@ -174,10 +174,24 @@ function titleFromProjection(sessionId) {
   }
 }
 
-/** 判断是不是子代理 / 委派回合。 */
-function isSubagentSession(session) {
+/**
+ * 判断是不是子代理 / 委派回合。
+ *
+ * ── 曾经判错，害用户"整条会话收不到邮件"（2026-09-24 用户报告）──
+ * 原实现是 `Boolean(header.parentSession) || delegationDepth > 0`，
+ * 把「有 parentSession」直接当子代理。但用户日常干活的会话**也可能挂着父会话**
+ * （实测 haF1 那条会话：69 次 turn/end 全部闭合、用户当天还在里面聊了两轮，
+ * 却一封摘要都没发 —— 因为被这里判成子代理跳过了）。
+ *
+ * `delegationDepth` 才是"委派深度"：真子代理是 1+，普通会话是 0 或缺失。
+ * 所以只认它。
+ *
+ * @param {any} session - 会话。
+ * @returns {boolean}
+ */
+export function isSubagentSession(session) {
   const header = session?.header ?? {}
-  return Boolean(header.parentSession) || Number(header.delegationDepth ?? 0) > 0
+  return Number(header.delegationDepth ?? 0) > 0
 }
 
 /**
@@ -415,7 +429,7 @@ export function apply(ctx) {
   }
 
   /**
-   * 一轮结束：拼摘要、发信。
+   * 一轮结束时：标记结束、做门槛检查，然后交给 sendDigest 发信。
    * @param {any} session - 会话。
    * @param {any} event - `turn/end` 事件。
    */
