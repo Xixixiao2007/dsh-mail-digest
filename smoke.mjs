@@ -409,19 +409,25 @@ console.log('\n[10] 审批仲裁（回归：2026-09-23 14:21「邮件批准了�
 
 console.log('\n[11] 子代理判定（回归：2026-09-24「整条会话收不到邮件」）')
 {
-  // 真实故障：haF1 那条会话 69 次 turn/end 全部闭合、用户当天还在里面聊了两轮，
-  // 却一封摘要都没发。原因是把「有 parentSession」当子代理 —— 而用户日常干活的
-  // 会话也可能挂着父会话。delegationDepth 才是委派深度。
+  // 真实故障：一条 69 次 turn/end 全部闭合、用户当天还在聊的会话，一封摘要都没发。
+  // 原因是把「有 parentSession」当子代理 —— 而 parentSession 的官方含义是
+  // 「从哪个会话 fork 出来的」（种子血缘，配 isSeeded），与子代理无关。
+  // 子代理的权威标记是 origin='subagent'（唯一合法值），delegationDepth 为兜底。
   const { isSubagentSession } = plugin
 
   check('普通会话（空 header）→ 不是子代理', isSubagentSession({ header: {} }) === false)
   check('普通会话（depth=0）→ 不是子代理', isSubagentSession({ header: { delegationDepth: 0 } }) === false)
   check(
-    '★ 有 parentSession 但 depth=0 → 不是子代理（这就是那个 bug）',
-    isSubagentSession({ header: { parentSession: 'session-abc', delegationDepth: 0, isSeeded: true } }) === false,
+    '★ fork 出的正常会话（parentSession + isSeeded + depth=0）→ 不是子代理（这就是那个 bug）',
+    isSubagentSession({ header: { parentSession: 'session-abc', isSeeded: true, delegationDepth: 0 } }) === false,
   )
   check('有 parentSession 且没写 depth → 不是子代理', isSubagentSession({ header: { parentSession: 'session-abc' } }) === false)
-  check('真子代理（depth=1）→ 是子代理', isSubagentSession({ header: { parentSession: 'session-abc', delegationDepth: 1 } }) === true)
+  check('origin=subagent → 是子代理（权威标记）', isSubagentSession({ header: { origin: 'subagent', delegationDepth: 1 } }) === true)
+  check(
+    'origin=subagent 但 depth=0 → 仍判为子代理（origin 优先）',
+    isSubagentSession({ header: { origin: 'subagent', delegationDepth: 0 } }) === true,
+  )
+  check('真子代理（depth=1，无 origin）→ 是子代理', isSubagentSession({ header: { parentSession: 'session-abc', delegationDepth: 1 } }) === true)
   check('真子代理（depth=2）→ 是子代理', isSubagentSession({ header: { delegationDepth: 2 } }) === true)
   check('字符串 depth="1" 也认', isSubagentSession({ header: { delegationDepth: '1' } }) === true)
   check('session 为 null 不炸', isSubagentSession(null) === false)

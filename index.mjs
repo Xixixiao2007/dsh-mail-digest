@@ -179,18 +179,29 @@ function titleFromProjection(sessionId) {
  *
  * ── 曾经判错，害用户"整条会话收不到邮件"（2026-09-24 用户报告）──
  * 原实现是 `Boolean(header.parentSession) || delegationDepth > 0`，
- * 把「有 parentSession」直接当子代理。但用户日常干活的会话**也可能挂着父会话**
- * （实测 haF1 那条会话：69 次 turn/end 全部闭合、用户当天还在里面聊了两轮，
- * 却一封摘要都没发 —— 因为被这里判成子代理跳过了）。
+ * 把「有 parentSession」当子代理。**这是错的。**
  *
- * `delegationDepth` 才是"委派深度"：真子代理是 1+，普通会话是 0 或缺失。
- * 所以只认它。
+ * DSH 的会话头字段各有明确含义（见 @deepseek-ai/dsh-session 的类型定义）：
+ *   - `parentSession`：「这个会话是从哪个会话 **fork** 出来的」（种子血缘），
+ *     配 `isSeeded: true` 表示继承了父会话的事件前缀。**与子代理无关** ——
+ *     用户"从老对话继续聊"就会得到这种头。
+ *   - `origin`：子代理的权威标记，唯一的合法值就是 `'subagent'`
+ *     （dsh-session 的校验器会拒绝其它值）。
+ *   - `delegationDepth`：委派深度，真子代理是「父深度 + 1」（≥1），
+ *     普通会话是 0 或缺失。
+ *
+ * 实测那条被害的会话：`{ parentSession: '…', isSeeded: true, delegationDepth: 0 }`
+ * 且**没有** `origin` —— 是 fork 出来的正常会话，69 次 turn/end 全闭合，
+ * 用户当天还在里面聊了两轮，却因为被误判成子代理而一封邮件都没发。
+ *
+ * 所以只认 `origin`（权威）与 `delegationDepth`（兜底）。
  *
  * @param {any} session - 会话。
  * @returns {boolean}
  */
 export function isSubagentSession(session) {
   const header = session?.header ?? {}
+  if (header.origin === 'subagent') return true
   return Number(header.delegationDepth ?? 0) > 0
 }
 
