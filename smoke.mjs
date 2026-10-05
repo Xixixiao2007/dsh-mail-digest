@@ -112,6 +112,34 @@ check('output DSL 编译出 required', JSON.stringify(captured.tool?.output?.sch
   JSON.stringify(captured.tool?.output?.schema))
 check('订阅了 session/event', typeof captured.handlers['session/event'] === 'function')
 
+console.log('\n[2b] 工具描述必须写明「本工具不发信」（回归：2026-10-05 Auto review 拦截）')
+{
+  // 为什么这条要有测试：auto-review 按「工具描述 + 参数」判断这个动作实际会做什么，
+  // 它把「外部发送」列为 medium（须明确授权）、「向外部发送隐私数据」列为 high（硬拒）。
+  // 而 mail_digest **只写本机队列、根本不发信**（发信在 turn/end，不经工具层）。
+  // 描述里若写「要发进邮件」「每次发信都带上」，reviewer 就会判成外发而拦截。
+  const def = captured.tool
+  const text = String(def?.description ?? '')
+  const props = def?.parameters?.properties ?? {}
+  const allText = text + ' ' + JSON.stringify(def?.parameters ?? {})
+
+  check('描述了「不发信」这一事实', /不发信|不发送|不调用 SMTP/.test(text))
+
+  // 反向断言：不能出现会让 reviewer 判成"外发"的措辞
+  const risky = [
+    { re: /发进邮件/, why: '「发进邮件」会被读成外发动作' },
+    { re: /每次发信都带上/, why: '「每次发信都带上」会被读成随信外发' },
+    { re: /显示在邮件里/, why: '「显示在邮件里」会被读成外发' },
+    { re: /提交一条摘要给.*邮件/, why: '整句像在描述一个发送动作' },
+  ]
+  for (const r of risky) {
+    check(`不含危险措辞：${r.why}`, !r.re.test(text), (text.match(r.re) ?? [''])[0])
+  }
+
+  check('pendingPermissions 说明是"只写本地文件"', /只.*写入本地文件|不发送任何内容/.test(String(props.pendingPermissions?.description ?? '')))
+  check('summary 说明是纯文本（无路径/命令/凭据）', /不含文件路径/.test(String(props.summary?.description ?? '')))
+}
+
 console.log('\n[3] 摘要函数')
 const sample = [
   '## 已完成',
